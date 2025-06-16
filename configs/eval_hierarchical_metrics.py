@@ -1,7 +1,6 @@
 from hycoclip.config import LazyCall as L
 from hycoclip.evaluation.hierarchical_metrics import HierarchicalMetricsEvaluator
 
-
 evaluator = L(HierarchicalMetricsEvaluator)(
     datasets_and_prompts={
         "imagenet": [
@@ -14,6 +13,6 @@ evaluator = L(HierarchicalMetricsEvaluator)(
             "pics : a photo of the small {}.",
         ]
     },
-    data_dir="/scratch-shared/apal/meru_eval",
-    image_size=224
+    data_dir="datasets/eval",
+    image_size=224,
 )
