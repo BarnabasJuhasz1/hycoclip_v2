@@ -9,7 +9,7 @@
 from hycoclip.config import LazyCall as L
 from hycoclip.encoders.image_encoders import build_timm_vit
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
-from hycoclip.models import CLIPBaseline
+from hycoclip.models2 import CLIPBaseline
 
 from .train_hycoclip_vit_l import dataset, optim, train
 
@@ -24,6 +24,8 @@ model = L(CLIPBaseline)(
         arch="L12_W512", vocab_size=49408, context_length=77
     ),
     embed_dim=512,
+    use_boxes=True,
+    loss_fn="clip_loss"
 )
 
 optim.optimizer.params.exclude_params = ["logit_scale"]

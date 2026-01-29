@@ -104,7 +104,7 @@ class CheckpointManager:
         # Save checkpoint corresponding to current iteration.
         torch.save(out_state_dict, self.output_dir / f"checkpoint_final.pth")
 
-    def resume(self) -> int:
+    def resume(self, model_only=False) -> int:
         """
         Find the last saved checkpoint in :attr:`output_dir` (from a previous job)
         and load it to resume the job. This method will log a warning message if
@@ -117,7 +117,7 @@ class CheckpointManager:
         if last_ckpt_info_file.exists():
             ckpt_path = last_ckpt_info_file.read_text().strip()
             logger.info(f"Found last checkpoint in {self.output_dir}: {ckpt_path}")
-            return self.load(self.output_dir / ckpt_path)
+            return self.load(self.output_dir / ckpt_path, model_only)
         else:
             logger.warning(
                 f"No checkpoint found in {self.output_dir} to resume job! "
@@ -125,7 +125,7 @@ class CheckpointManager:
             )
             return 0
 
-    def load(self, path: str | Path) -> int:
+    def load(self, path: str | Path, model_only=False) -> int:
         """
         Load a saved checkpoint from a given file path. This method tries to find
         each of :attr:`checkpointables` in the file and load their state dict.
@@ -142,7 +142,7 @@ class CheckpointManager:
         rank = dist.get_rank()
 
         logger.info(f"Rank {rank}: Loading checkpoint from {path}")
-        checkpoint = torch.load(path, map_location="cpu")
+        checkpoint = torch.load(path, map_location="cpu", weights_only=False)
         iteration = checkpoint.pop("iteration", -1)
 
         # Keep flags of all checkpointables to lo which ones were not loaded.
@@ -156,7 +156,9 @@ class CheckpointManager:
                 #     logger.info(f"Rank {rank}: Not loading {key} from {path}")
                 #     continue
                 ########### Lines added till here ############
-
+                if model_only and "model" not in key:
+                    continue
+                    
                 logger.info(f"Rank {rank}: Loading {key} from {path}")
 
                 if isinstance(self.checkpointables[key], DistributedDataParallel):

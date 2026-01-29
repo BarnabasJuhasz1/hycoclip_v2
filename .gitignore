@@ -40,11 +40,18 @@ ENV/
 
 # Data (symlinks) directory, model checkpoints, tensorboard logs etc.
 datasets/
+datasets
 checkpoints/
+checkpoints
 output/
 train_results/
+train_results
 jobs/
 visualizations/
+wandb/
+finetuning/
+unsloth_compiled_cache/
+saved_embeddings/
 
 # vim stuff
 *.swp
@@ -52,3 +59,7 @@ visualizations/
 # Snellius job outputs
 *.out
 *.job
+
+
+# detached sub-repo
+VL-CheckList/

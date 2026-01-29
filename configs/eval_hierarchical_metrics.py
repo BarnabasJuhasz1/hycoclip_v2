@@ -14,6 +14,7 @@ evaluator = L(HierarchicalMetricsEvaluator)(
             "pics : a photo of the small {}.",
         ]
     },
-    data_dir="/scratch-shared/apal/meru_eval",
+    #data_dir="/scratch-shared/apal/meru_eval",
+    data_dir="datasets/eval",
     image_size=224
 )

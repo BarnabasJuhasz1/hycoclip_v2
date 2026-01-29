@@ -27,6 +27,11 @@ from hycoclip.models import HyCoCLIP, MERU, CLIPBaseline
 from hycoclip.utils.checkpointing import CheckpointManager
 from hycoclip.tokenizer import Tokenizer
 
+#Disable Huggingface’s online requests
+import os
+os.environ['HF_DATASETS_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+
 
 parser = argparse.ArgumentParser(description=__doc__)
 _AA = parser.add_argument

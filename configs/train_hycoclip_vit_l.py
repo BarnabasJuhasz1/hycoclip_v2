@@ -22,16 +22,16 @@ from torch.optim import AdamW
 from torchvision import transforms as T
 
 from hycoclip.config import LazyCall as L
-from hycoclip.data.webdataset_mapper import GroundedDatasetTarMapper, ImageTextWebDataset
+from hycoclip.data.webdataset_mapper import ExtendedGroundedDatasetTarMapper, ImageTextWebDataset
 from hycoclip.encoders.image_encoders import build_timm_vit
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
-from hycoclip.models import HyCoCLIP
+from hycoclip.models2 import HyCoCLIP
 from hycoclip.optim import LinearWarmupCosineDecayLR, set_weight_decay_per_param
 
 
 dataset = L(ImageTextWebDataset)(
-    tarfiles=["datasets/train/GRIT/processed/*.tar"],
-    mapper=L(GroundedDatasetTarMapper)(
+    tarfiles=["datasets/train/GRIT/tar_fitted/*.tar"],
+    mapper=L(ExtendedGroundedDatasetTarMapper)(
         image_transform=[
             L(T.RandomResizedCrop)(
                 size=224, scale=(0.5, 1.0), interpolation=T.InterpolationMode.BICUBIC
@@ -58,6 +58,7 @@ model = L(HyCoCLIP)(
     learn_curv=True,
     entail_weight=0.2,
     use_boxes=True,
+    loss_fn="hycoclip_loss" # or "chordclip_loss" to train ChordCLIP
 )
 
 
@@ -86,7 +87,7 @@ train = dict(
     seed=0,
     amp=True,
     total_batch_size=768,
-    num_iterations=500000,
+    num_iterations=90000,
     cudnn_benchmark=True,
     cudnn_deterministic=False,
     num_workers=4,

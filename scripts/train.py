@@ -21,7 +21,8 @@ import torch
 import numpy as np
 from loguru import logger
 from omegaconf import OmegaConf
-from torch.cuda import amp
+# from torch.cuda import amp
+import torch.amp as amp
 from torch.utils.tensorboard import SummaryWriter
 
 import hycoclip.utils.distributed as dist
@@ -29,7 +30,18 @@ from hycoclip.config import LazyConfig, LazyFactory
 from hycoclip.tokenizer import Tokenizer
 from hycoclip.utils.checkpointing import CheckpointManager
 from hycoclip.utils.timer import Timer
-from hycoclip.models import HyCoCLIP
+
+from hycoclip.models import HyCoCLIP, HyCoCLIP_Re_Weight, HyCoCLIP_Re_Modulate, HyCoCLIP_Re_Combined
+from hycoclip.new_models.re_weight_DinContrastive import HyCoCLIP_Re_Weight_DinContrastive
+from hycoclip.new_models.re_weight_withoutD import HyCoCLIP_Re_Weight_withoutD
+
+
+from finetuning.wandb import initialize_wandb_logger 
+
+#Disable Huggingface’s online requests
+import os
+os.environ['HF_DATASETS_OFFLINE'] = '1'
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
 
 
 # fmt: off
@@ -83,6 +95,9 @@ def main(_A: argparse.Namespace):
     # Create a config object and perform common setup.
     _C = LazyConfig.load(_A.config)
     _C = LazyConfig.apply_overrides(_C, _A.overrides)
+    
+    # Initialize WandDB logger
+    wandb = initialize_wandb_logger(_C)
 
     # Get process rank and world size (assuming distributed is initialized).
     RANK = dist.get_rank()
@@ -139,7 +154,7 @@ def main(_A: argparse.Namespace):
         scheduler=scheduler,
         scaler=scaler,
     )
-    start_iteration = checkpoint_manager.resume() if _A.resume else 0
+    start_iteration = checkpoint_manager.resume(model_only=False) if _A.resume else 0
 
     # Create an iterator from dataloader to sample batches perpetually.
     dataloader_iter = iter(dataloader)
@@ -159,19 +174,52 @@ def main(_A: argparse.Namespace):
 
         timer.tic()
         optimizer.zero_grad()
-        with amp.autocast(enabled=_C.train.amp):
+        with amp.autocast(enabled=_C.train.amp, device_type=device.type):
             # Get image and text (tokens) from batch and pass through model.
 
-            if isinstance(model, HyCoCLIP):
+            # if the ReWeight module, the ReModulate module or the ReCombined module is used
+            if ((isinstance(model, HyCoCLIP_Re_Weight) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight))) or
+                (isinstance(model, HyCoCLIP_Re_Modulate) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Modulate))) or
+                (isinstance(model, HyCoCLIP_Re_Combined) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Combined))) or
+                (isinstance(model, HyCoCLIP_Re_Weight_DinContrastive) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight_DinContrastive))) or
+                (isinstance(model, HyCoCLIP_Re_Weight_withoutD) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight_withoutD)))):                
+                
                 tokens = tokenizer(batch["text"])
                 box_tokens = tokenizer(batch["box_text"])
+
+                # safety check to make sure the hierarchies last element always corresponds to the box text
+                first_elements = [inner_list[0] for inner_list in batch["hierarchy"]]
+                for i in range(len(batch['hierarchy'])):
+                    assert(batch['box_text'][i]==first_elements[i]), "Found discrepancy between box_tokens and hierarchy ending tokens! There should not be a mismatch!"
+    
+                # get the hierarchy tokens as a list
+                hierarchy_tokens = [tokenizer(hier) for hier in batch["hierarchy"]]
+
+                output_dict = model(batch["image"].to(device),
+                                    batch["box_image"].to(device),
+                                    tokens,
+                                    box_tokens,
+                                    hierarchy_tokens,
+                                    batch["pairwise_scores"].to(device))
+            
+            elif isinstance(model, HyCoCLIP) or isinstance(model.module, HyCoCLIP):
+                # print("Original HyCoCLIP instance detected!")
+                tokens = tokenizer(batch["text"])
+                box_tokens = tokenizer(batch["box_text"])
+                # print("INPUT DIM: ", batch["image"].shape, " ", batch["box_image"].shape)
+                # batch["image"] = batch["image"].to(torch.bfloat16)
+                # batch["box_image"] = batch["box_image"].to(torch.bfloat16)
+                # model.module.visual_proj.weight = model.module.visual_proj.weight.to(torch.bfloat16)
+
                 output_dict = model(batch["image"].to(device),
                                     batch["box_image"].to(device),
                                     tokens,
                                     box_tokens)
             else:
+                # print("WARNING: unknown instance")
                 tokens = tokenizer(batch["text"])
                 output_dict = model(batch["image"].to(device), tokens)
+                
 
             loss = output_dict["loss"]
 
@@ -193,6 +241,8 @@ def main(_A: argparse.Namespace):
                 log_str += f" [{key} {value:.3f}]"
 
             logger.info(log_str)
+            # Log metrics to wandb.
+            wandb.log(output_dict["logging"])
 
             if dist.is_main_process():
                 tboard.add_scalar("lr", scheduler.get_last_lr()[0], iteration)
@@ -207,7 +257,8 @@ def main(_A: argparse.Namespace):
     # Save the final checkpoint.
     if dist.is_main_process():
         checkpoint_manager.final_step()
-
+        # Finish the run and upload any remaining data.
+        wandb.finish()
 
 if __name__ == "__main__":
     _A = parser.parse_args()

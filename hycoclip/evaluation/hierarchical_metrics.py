@@ -162,7 +162,7 @@ class HierarchicalMetricsEvaluator(ZeroShotClassificationEvaluator):
 
             # shape: (num_classes, embed_dim)
             classifier = torch.stack(all_class_feats, dim=0)
-
+            
             # Extract image features and labels from the test split of required dataset.
             loader = DataLoader(
                 DatasetCatalog.build(

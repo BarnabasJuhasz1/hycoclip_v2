@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Callable
 
 import torch
+import numpy as np
 import yaml
 from hydra.utils import instantiate
 from omegaconf import DictConfig, ListConfig, OmegaConf
@@ -195,11 +196,32 @@ class LazyConfig:
         return OmegaConf.merge(cfg, OmegaConf.from_dotlist(overrides))
 
 
+
 class LazyFactory:
     """
     Provides a clean interface to easily construct essential objects from input
     lazy configs (omegaconf): dataloader, model, optimizer, and LR scheduler.
     """
+
+    # Added for HyCoCLIP_V2
+    @staticmethod
+    def safe_collate(batch):
+        result = {}
+        for key in batch[0].keys():
+            values = [d[key] for d in batch]
+            sample = values[0]
+            if isinstance(sample, torch.Tensor):
+                result[key] = torch.stack(values)
+            elif isinstance(sample, (str, list)):
+                # Important: strings and lists (like hierarchy) stay as list-of-objects
+                result[key] = values
+            elif isinstance(sample, np.ndarray):
+                # Stack numpy arrays and convert to Tensor,
+                # because scores are coming as numpy array but rest of code expects torch tensor
+                result[key] = torch.from_numpy(np.stack(values))
+            else:
+                raise TypeError(f"Unsupported type for key '{key}': {type(sample)}")
+        return result
 
     @staticmethod
     def build_dataloader(cfg: DictConfig):
@@ -210,6 +232,8 @@ class LazyFactory:
             batch_size=cfg.train.total_batch_size // dist.get_world_size(),
             drop_last=True,
             pin_memory=True,
+            # Added for HyCoCLIP_V2
+            collate_fn=LazyFactory.safe_collate
         )
 
     @staticmethod
@@ -241,4 +265,8 @@ class LazyFactory:
 
     @staticmethod
     def build_lr_scheduler(cfg: DictConfig, optimizer: optim.Optimizer):
-        return instantiate(cfg.optim.lr_scheduler, optimizer=optimizer)
+        # print("TSTEPS: ", cfg.optim.lr_scheduler.total_steps)
+        # print("WSTEPS: ", cfg.optim.lr_scheduler.warmup_steps)
+
+        return instantiate(cfg.optim.lr_scheduler,
+                           optimizer=optimizer)

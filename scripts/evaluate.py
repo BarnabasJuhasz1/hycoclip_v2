@@ -41,6 +41,8 @@ def main(_A: argparse.Namespace):
     _C = LazyConfig.load(_A.config)
     logger.info(OmegaConf.to_yaml(_C))
 
+    print("C_TRAIN: ", _C_TRAIN)
+
     logger.info("Command line args:")
     for arg in vars(_A):
         logger.info(f"{arg:<20}: {getattr(_A, arg)}")

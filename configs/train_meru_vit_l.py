@@ -11,7 +11,7 @@
 from hycoclip.config import LazyCall as L
 from hycoclip.encoders.image_encoders import build_timm_vit
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
-from hycoclip.models import MERU
+from hycoclip.models2 import MERU
 
 from .train_hycoclip_vit_l import dataset, optim, train
 
@@ -29,5 +29,7 @@ model = L(MERU)(
     curv_init=1.0,
     learn_curv=True,
     entail_weight=0.2,
-    use_boxes=False,
+    use_boxes=True, # USING BOXES
+    use_hierarchies=False,
+    loss_fn="meru_loss", # or "meru_loss",
 )
