@@ -1,6 +1,6 @@
 # Compositional Entailment Learning for Hyperbolic Vision-Language Models
 
-[[Arxiv](https://arxiv.org/abs/2410.06912)]
+[[Paper](https://arxiv.org/abs/2410.06912)]
 
 Avik Pal, Max van Spengler, Guido D’Amely, Alessandro Flaborea, Fabio Galasso, Pascal Mettes
 
@@ -37,8 +37,8 @@ Download models from [`model-zoo`](./model-zoo.md) and place it in `./checkpoint
 
 1. **Zero-shot image classification**:
 
-The evaluation script auto-downloads and caches 18 (out of 20) datasets in `./datasets/eval`, for ImageNet and Stanford Dogs follow as next. Download and symlink the ImageNet dataset ([Torchvision ImageFolder](https://pytorch.org/vision/main/generated/torchvision.datasets.ImageFolder.html)
-style) at `./datasets/eval/imagenet`. The Stanford Dogs dataset also needs to be set-up manually using instructions provided in [Pytorch issue 7545](https://github.com/pytorch/vision/issues/7545#issuecomment-1631441616) at `./datasets/eval/cars/stanford_cars`. To evaluate HyCoCLIP-ViT-S/16 on the datasets, run the following command.
+The evaluation script auto-downloads and caches 18 (out of 20) datasets in `./datasets/eval`, for ImageNet and Stanford Cars follow as next. Download and symlink the ImageNet dataset ([Torchvision ImageFolder](https://pytorch.org/vision/main/generated/torchvision.datasets.ImageFolder.html)
+style) at `./datasets/eval/imagenet`. The Stanford Cars dataset also needs to be set-up manually using instructions provided in [Pytorch issue 7545](https://github.com/pytorch/vision/issues/7545#issuecomment-1631441616) at `./datasets/eval/cars/stanford_cars`. To evaluate HyCoCLIP-ViT-S/16 on the datasets, run the following command.
 
 ```
 python scripts/evaluate.py --config configs/eval_zero_shot_classification.py \
@@ -146,14 +146,18 @@ python scripts/spatial_norm_dist.py --checkpoint-path checkpoints/hycoclip_vit_s
 If this work was helpful in your research, please use the following BibTex entry.
 
 ```bibtex
-@article{PalSDFGM2024,
-      title={Compositional Entailment Learning for Hyperbolic Vision-Language Models},
-      author={Avik Pal and Max van Spengler and Guido Maria D'Amely di Melendugno and Alessandro Flaborea and Fabio Galasso and Pascal Mettes},
-      year={2024},
-      eprint={2410.06912},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2410.06912},
+@inproceedings{PalSDFGM2024,
+  author       = {Avik Pal and
+                  Max van Spengler and
+                  Guido Maria D'Amely di Melendugno and
+                  Alessandro Flaborea and
+                  Fabio Galasso and
+                  Pascal Mettes},
+  title        = {Compositional Entailment Learning for Hyperbolic Vision-Language Models},
+  booktitle    = {The Thirteenth International Conference on Learning Representations,
+                  {ICLR} 2025, Singapore, April 24-28, 2025},
+  year         = {2025},
+  url          = {https://openreview.net/forum?id=3i13Gev2hV},
 }
 ```
 
