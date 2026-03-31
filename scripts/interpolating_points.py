@@ -23,7 +23,8 @@ from huggingface_hub import snapshot_download
 
 from hycoclip import lorentz as L
 from hycoclip.config import LazyConfig, LazyFactory
-from hycoclip.models import HyCoCLIP, MERU, CLIPBaseline
+from hycoclip.models2 import HyCoCLIP_Re_Weight, HyCoCLIP, MERU, CLIPBaseline
+
 from hycoclip.utils.checkpointing import CheckpointManager
 from hycoclip.tokenizer import Tokenizer
 
@@ -53,7 +54,7 @@ def interpolate(model, feats: torch.Tensor, root_feat: torch.Tensor, steps: int)
 
     # Linear interpolation between root and image features. For HyCoCLIP and MERU,
     # this happens in the tangent space of the origin.
-    if isinstance(model, (HyCoCLIP, MERU)):
+    if isinstance(model, (HyCoCLIP_Re_Weight, HyCoCLIP, MERU)):
         feats = L.log_map0(feats, model.curv.exp())
 
     interp_feats = [
@@ -63,7 +64,7 @@ def interpolate(model, feats: torch.Tensor, root_feat: torch.Tensor, steps: int)
     interp_feats = torch.stack(interp_feats)
 
     # Lift on the Hyperboloid (for HyCoCLIP and MERU), or L2 normalize (for CLIP).
-    if isinstance(model, (HyCoCLIP, MERU)):
+    if isinstance(model, (HyCoCLIP_Re_Weight, HyCoCLIP, MERU)):
         feats = L.log_map0(feats, model.curv.exp())
         interp_feats = L.exp_map0(interp_feats, model.curv.exp())
     else:
@@ -87,7 +88,7 @@ def calc_scores(
 
     all_scores = []
 
-    if isinstance(model, (HyCoCLIP, MERU)):
+    if isinstance(model, (HyCoCLIP_Re_Weight, HyCoCLIP, MERU)):
         for feats_batch in all_feats.split(65536):
             scores = L.pairwise_inner(image_feats, feats_batch, model.curv.exp())
             all_scores.append(scores)
@@ -213,7 +214,7 @@ class Resizer:
 def get_data_feats(device, 
                    resizer: Resizer,
                    tsv_path: str,
-                   model: HyCoCLIP | MERU | CLIPBaseline) -> tuple[list[str], torch.Tensor]:
+                   model: HyCoCLIP_Re_Weight | HyCoCLIP | MERU | CLIPBaseline) -> tuple[list[str], torch.Tensor]:
     tokenizer = Tokenizer()
     image_transform = T.Compose(
         [T.Resize(224, T.InterpolationMode.BICUBIC), T.CenterCrop(224), T.ToTensor()]
@@ -332,7 +333,7 @@ def main(_A: argparse.Namespace):
 
     CheckpointManager(model=model).load(_A.checkpoint_path)
 
-    if isinstance(model, (HyCoCLIP, MERU)):
+    if isinstance(model, (HyCoCLIP_Re_Weight, HyCoCLIP, MERU)):
         root_feat = torch.zeros(_C_TRAIN.model.embed_dim, device=device)
     else:
         # CLIP model checkpoint should have the 'root' embedding.

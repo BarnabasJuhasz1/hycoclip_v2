@@ -216,7 +216,7 @@ class LazyFactory:
                 # Important: strings and lists (like hierarchy) stay as list-of-objects
                 result[key] = values
             elif isinstance(sample, np.ndarray):
-                # Stack numpy arrays and convert to Tensor,
+                # Stack numpy arrays and convert to torch tensor,
                 # because scores are coming as numpy array but rest of code expects torch tensor
                 result[key] = torch.from_numpy(np.stack(values))
             else:

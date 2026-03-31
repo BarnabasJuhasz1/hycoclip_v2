@@ -20,7 +20,7 @@ import hycoclip.utils.distributed as dist
 from hycoclip import lorentz as L
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
 
-from hycoclip.models import MERU
+from hycoclip.models2 import MERU
 
 class HyCoCLIP_Re_Weight_DinContrastive(MERU):
     """
@@ -36,7 +36,7 @@ class HyCoCLIP_Re_Weight_DinContrastive(MERU):
         curv_init: float = 1.0,
         learn_curv: bool = True,
         entail_weight: float = 0.0,
-        use_boxes: bool = True,
+        contrast_weight: float = 1.0,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         use_hierarchies: bool = True,
@@ -49,7 +49,18 @@ class HyCoCLIP_Re_Weight_DinContrastive(MERU):
             cont_weights: Hyperparameters for hierarchical contrastive loss weights.
 
         """
-        super().__init__(visual, textual, embed_dim, curv_init, learn_curv, entail_weight, use_boxes, pixel_mean, pixel_std)
+        super().__init__(visual=visual,
+                         textual=textual,
+                         embed_dim=embed_dim,
+                         curv_init=curv_init,
+                         learn_curv=learn_curv,
+                         entail_weight=entail_weight,
+                         use_boxes=False, # NOTE: use-boxes is always set to false for the parent, otherwise the forward loop is being overwritten
+                         pixel_mean=pixel_mean,
+                         pixel_std=pixel_std)
+        
+        self.contrast_weight = contrast_weight
+
         assert use_hierarchies, "HyCoCLIP_Re_Weight requires caption hierarchies to function."
 
     def forward(
@@ -152,7 +163,7 @@ class HyCoCLIP_Re_Weight_DinContrastive(MERU):
 
             # original hycoclip contrastive loss
             # Re Weight TOGETHER: 
-            contrastive_loss = 0.2 * (
+            contrastive_loss = (
                 nn.functional.cross_entropy(_scale * image_logits, targets)
                 + nn.functional.cross_entropy(_scale * text_logits, targets)
                 + nn.functional.cross_entropy(_scale * box_image_logits, targets)
@@ -216,13 +227,7 @@ class HyCoCLIP_Re_Weight_DinContrastive(MERU):
                 + (pairwise_scores[3] * hier_entailment_loss_4).mean()
             )
 
-            loss = contrastive_loss
-            if self.entail_weight > 0:
-                loss = loss + self.entail_weight * entailment_loss
-
-            # extra loss term: hyper_param * average elementwise distance between hierarchy entries
-            # if self.hier_distance_weight > 0:
-            #     loss = loss + self.hier_distance_weight * mean_elementwise_dist
+            loss = self.contrast_weight * contrastive_loss + self.entail_weight * entailment_loss
 
         returnDict = {
             "loss": loss,

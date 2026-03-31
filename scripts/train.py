@@ -143,6 +143,13 @@ def main(_A: argparse.Namespace):
 
     model = LazyFactory.build_model(_C, device)
 
+    use_hierarchies = _C.model.use_hierarchies
+    if use_hierarchies:
+        use_boxes = True
+    else:
+        use_boxes = _C.model.use_boxes
+
+
     optimizer = LazyFactory.build_optimizer(_C, model)
     scheduler = LazyFactory.build_lr_scheduler(_C, optimizer)
     scaler = amp.GradScaler(enabled=_C.train.amp)
@@ -177,49 +184,44 @@ def main(_A: argparse.Namespace):
         with amp.autocast(enabled=_C.train.amp, device_type=device.type):
             # Get image and text (tokens) from batch and pass through model.
 
-            # if the ReWeight module, the ReModulate module or the ReCombined module is used
-            if ((isinstance(model, HyCoCLIP_Re_Weight) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight))) or
-                (isinstance(model, HyCoCLIP_Re_Modulate) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Modulate))) or
-                (isinstance(model, HyCoCLIP_Re_Combined) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Combined))) or
-                (isinstance(model, HyCoCLIP_Re_Weight_DinContrastive) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight_DinContrastive))) or
-                (isinstance(model, HyCoCLIP_Re_Weight_withoutD) or (hasattr(model, "module") and isinstance(model.module, HyCoCLIP_Re_Weight_withoutD)))):                
-                
-                tokens = tokenizer(batch["text"])
-                box_tokens = tokenizer(batch["box_text"])
 
-                # safety check to make sure the hierarchies last element always corresponds to the box text
-                first_elements = [inner_list[0] for inner_list in batch["hierarchy"]]
-                for i in range(len(batch['hierarchy'])):
-                    assert(batch['box_text'][i]==first_elements[i]), "Found discrepancy between box_tokens and hierarchy ending tokens! There should not be a mismatch!"
-    
-                # get the hierarchy tokens as a list
-                hierarchy_tokens = [tokenizer(hier) for hier in batch["hierarchy"]]
+            tokens = tokenizer(batch["text"])
+
+            if use_hierarchies:
+                            
+                box_tokens = tokenizer(batch["box_text"])
+                # print(f"Outer box token list length: {len(box_tokens)}")
+                # print(f"box token shape: {box_tokens[0].shape}")
+                text_hierarchy_tokens = [tokenizer(h) for h in batch["text_hierarchy"]]
+
+                # len(box_tokens) = batch / num_gpu = 192
+                
+                # 192
+                # print(f"Outer list length: {len(text_hierarchy_tokens)}")
+                # 4
+                # print(f"Inner list length: {len(text_hierarchy_tokens[0])}")
+                # tensor
+                # print(f"Tensor shape: {text_hierarchy_tokens[0][0].shape}")
+
+                # box_tokens shape: 192 x tensor
+                # text_hierarchy_tokens shape: 192 x 4 x tensor
 
                 output_dict = model(batch["image"].to(device),
                                     batch["box_image"].to(device),
                                     tokens,
                                     box_tokens,
-                                    hierarchy_tokens,
-                                    batch["pairwise_scores"].to(device))
-            
-            elif isinstance(model, HyCoCLIP) or isinstance(model.module, HyCoCLIP):
-                # print("Original HyCoCLIP instance detected!")
-                tokens = tokenizer(batch["text"])
-                box_tokens = tokenizer(batch["box_text"])
-                # print("INPUT DIM: ", batch["image"].shape, " ", batch["box_image"].shape)
-                # batch["image"] = batch["image"].to(torch.bfloat16)
-                # batch["box_image"] = batch["box_image"].to(torch.bfloat16)
-                # model.module.visual_proj.weight = model.module.visual_proj.weight.to(torch.bfloat16)
-
-                output_dict = model(batch["image"].to(device),
-                                    batch["box_image"].to(device),
-                                    tokens,
-                                    box_tokens)
+                                    text_hierarchy_tokens,
+                                    batch["scores"].to(device))
             else:
-                # print("WARNING: unknown instance")
-                tokens = tokenizer(batch["text"])
-                output_dict = model(batch["image"].to(device), tokens)
-                
+
+                if use_boxes:
+                    box_tokens = tokenizer(batch["box_text"])
+                    output_dict = model(batch["image"].to(device),
+                                        batch["box_image"].to(device),
+                                        tokens,
+                                        box_tokens)
+                else:
+                    output_dict = model(batch["image"].to(device), tokens)
 
             loss = output_dict["loss"]
 

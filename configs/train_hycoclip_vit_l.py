@@ -38,6 +38,8 @@ dataset = L(ImageTextWebDataset)(
             ),
             L(T.ToTensor)(),
         ],
+        # use_extra_hierarchy_samples=False, # NOT using Deep-GRIT hierarchies by default
+        use_proposed_hierachies=False, # NOT using proposed hierarchies by default
     ),
     buffer_size=4000,
     seed="${..train.seed}",
@@ -57,8 +59,9 @@ model = L(HyCoCLIP)(
     curv_init=1.0,
     learn_curv=True,
     entail_weight=0.2,
-    use_boxes=True,
-    loss_fn="hycoclip_loss" # or "chordclip_loss" to train ChordCLIP
+    use_boxes=True, # USING BOXES by default
+    use_hierarchies=False, # NOT using Deep-GRIT hierarchies by default
+    loss_fn="hycoclip_loss" # default hycoclip loss
 )
 
 
@@ -87,7 +90,7 @@ train = dict(
     seed=0,
     amp=True,
     total_batch_size=768,
-    num_iterations=90000,
+    num_iterations=180000,
     cudnn_benchmark=True,
     cudnn_deterministic=False,
     num_workers=4,

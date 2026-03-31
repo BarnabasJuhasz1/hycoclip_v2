@@ -611,8 +611,7 @@ class HyCoCLIP_Re_Weight(MERU):
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         use_hierarchies: bool = True,
-        hier_distance_weight: float = 0.0,
-        loss_fn="hyco_reweight_loss",
+        hier_distance_weight: float = 0.0
     ):
         """
         Un-documented args are same as `HyCoCLIP`.

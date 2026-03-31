@@ -323,7 +323,7 @@ if __name__ == "__main__":
     
     parser_models.add_argument('--x-path', type=str, required=True, help='Path to the .npz file containing embeddings')
     parser_models.add_argument('--backend', type=str, choices=['matplotlib', 'plotly'], default='plotly', help='Backend for visualization')
-    
+
     args = parser.parse_args()
 
     if "fn" in args.__dict__:

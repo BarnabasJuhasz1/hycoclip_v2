@@ -21,6 +21,12 @@ from hycoclip import lorentz as L
 from hycoclip import losses
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
 
+# from fast.projects.amsterdam.InternVL.internvl_chat_llava.llava.model.multimodal_encoder.eva_clip.modeling_evaclip import contrastive_loss
+from enum import Enum
+
+class HierarchySampleType(Enum):
+    ALL = "ALL"
+    SINGLE_RANDOM = "SINGLE_RANDOM"
 
 
 def truncate_tokens(tokens: torch.Tensor, context_length: int) -> torch.Tensor:
@@ -45,6 +51,8 @@ class CLIPBaseline(nn.Module):
         textual: TransformerTextEncoder,
         embed_dim: int,
         use_boxes: bool = False,
+        use_hierarchies: bool = False,
+        hier_sample_type: HierarchySampleType = HierarchySampleType.ALL,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         loss_fn="clip_loss"
@@ -64,6 +72,7 @@ class CLIPBaseline(nn.Module):
         self.visual = visual
         self.textual = textual
         self.embed_dim = embed_dim
+        self.hier_sample_type = hier_sample_type
 
         # Linear layers to project image and text features such that they have
         # same size before computing dot-product similarity.
@@ -85,8 +94,15 @@ class CLIPBaseline(nn.Module):
         self._rank = dist.get_rank()
         self.loss_fn = losses.clip_loss
 
-        if use_boxes:
+        if use_hierarchies:
+            self.forward = self.forward_with_extra_samples
+        elif use_boxes:
             self.forward = self.forward_with_boxes
+
+        # otherwise, we use the default forward function
+        # self.use_boxes = use_boxes
+        # self.use_hierarchies = use_hierarchies
+        print(f"INSIDE CLIP INIT, USE BOXES AND HIERARCHIES IS SET TO: {use_boxes} and {use_hierarchies} and hier_sample_type is set to {hier_sample_type}")
 
     @property
     def device(self) -> torch.device:
@@ -198,38 +214,61 @@ class CLIPBaseline(nn.Module):
             tokens: List of tensors, each containing text tokens. Tensors may have
                 variable length (they will be padded internally).
         """
-        print("FORWARDING WITH BOXES!! ")
+        # box_tokens shape: 192 x tensor
+        # text_hierarchy_tokens shape: 192 x 4 x tensor
+
+        # print("Forwarding with extra hierarchy samples! ")
+        
         # Clamp temperature such that logits are not scaled more than 100x.
         # ln(100) = ~4.6052
         with torch.no_grad():
             self.logit_scale.clamp_(max=4.6052)
         _scale = self.logit_scale.exp()
 
-        inputs = [(images, tokens, False), (box_images, box_tokens, True)]
         outputs = []
-        for (img, txt, is_box) in inputs:
+        # compute original I-T sample loss
+        # shape: (batch_size, embed_dim)
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+
+        # Get features from all GPUs to increase negatives for contrastive loss.
+        # These will be lists of tensors with length = world size.
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+
+        # shape: (batch_size * world_size, embed_dim)
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        _rank = self._rank
+
+        # Compute logits for image-text contrastive loss: cosine similarity.
+        image_logits = _scale * image_feats @ all_text_feats.T
+        text_logits = _scale * text_feats @ all_image_feats.T
+
+        # Compute cross entropy loss: we compute log probabilities and take the
+        # diagonal elements as targets: image[i] should match text[i] in batch.
+        # Shift the targets according to rank of GPU process (we assume that all
+        # GPU processes have the same local batch size).
+        loss = self.loss_fn(
+            image_logits, text_logits, _rank, _scale
+        )
+        outputs.append(loss)    
+        
+        extra_text_samples = [box_tokens]
+
+        box_image_feats = self.encode_image(box_images, project=True)
+
+        # compute loss for the extra samples
+        for txt in extra_text_samples:
             # shape: (batch_size, embed_dim)
-            image_feats = self.encode_image(img, project=True)
-            text_feats = self.encode_text(txt, project=True)
+            txt_feats = self.encode_text(txt, project=True)
 
-            if is_box:
-                all_image_feats = image_feats
-                all_text_feats = text_feats
-                _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
-            else:
-                # Get features from all GPUs to increase negatives for contrastive loss.
-                # These will be lists of tensors with length = world size.
-                all_image_feats = dist.gather_across_processes(image_feats)
-                all_text_feats = dist.gather_across_processes(text_feats)
-
-                # shape: (batch_size * world_size, embed_dim)
-                all_image_feats = torch.cat(all_image_feats, dim=0)
-                all_text_feats = torch.cat(all_text_feats, dim=0)
-                _rank = self._rank
+            # we consider these all to be 'box' samples:
+            _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
 
             # Compute logits for image-text contrastive loss: cosine similarity.
-            image_logits = _scale * image_feats @ all_text_feats.T
-            text_logits = _scale * text_feats @ all_image_feats.T
+            image_logits = _scale * box_image_feats @ txt_feats.T
+            text_logits = _scale * txt_feats @ box_image_feats.T
 
             # Compute cross entropy loss: we compute log probabilities and take the
             # diagonal elements as targets: image[i] should match text[i] in batch.
@@ -240,12 +279,141 @@ class CLIPBaseline(nn.Module):
             )
             outputs.append(loss)
 
-        loss = 0.5 * (outputs[0]["loss"] + outputs[1]["loss"])
+        # loss = 0.5 * (outputs[0]["loss"] + outputs[1]["loss"])
+        
+        # compute average loss and contrastive loss across all samples
+        loss = 0.0
+        contrastive_loss = 0.0
+        for output in outputs:
+            loss += output["loss"]
+            contrastive_loss += output["logging"]["contrastive_loss"]
+        
+        loss /= len(outputs)
+        contrastive_loss /= len(outputs)
 
         return {
             "loss": loss,
             "logging": {
-                "contrastive_loss": 0.5 * (outputs[0]["logging"]["contrastive_loss"] + outputs[1]["logging"]["contrastive_loss"]),
+                "contrastive_loss": contrastive_loss,
+                "logit_scale": _scale,
+            },
+        }
+
+    def forward_with_extra_samples(
+        self, images: torch.Tensor, box_images: torch.Tensor,
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor],
+        hierarchy_tokens: list[list[torch.Tensor]], pairwise_scores: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+            tokens: List of tensors, each containing text tokens. Tensors may have
+                variable length (they will be padded internally).
+        """
+        # box_tokens shape: 192 x tensor
+        # text_hierarchy_tokens shape: 192 x 4 x tensor
+
+        # print("Forwarding with extra hierarchy samples! ")
+        
+        # Clamp temperature such that logits are not scaled more than 100x.
+        # ln(100) = ~4.6052
+        with torch.no_grad():
+            self.logit_scale.clamp_(max=4.6052)
+        _scale = self.logit_scale.exp()
+
+        # first we need to transpose the 192 x 4 x tensor to be 4 x 192 x tensor
+        transposed_hierarchy_tokens = [[row[i] for row in hierarchy_tokens] for i in range(len(hierarchy_tokens[0]))]
+        # print(f"Outer T hier tokens list length: {len(transposed_hierarchy_tokens)}")
+        # print(f"Inner T hier tokens list length: {len(transposed_hierarchy_tokens[0])}")
+        # print(f"Inner Inner T hier tokens tensor shape: {transposed_hierarchy_tokens[0][0].shape}")
+        
+        outputs = []
+        # compute original I-T sample loss
+        # shape: (batch_size, embed_dim)
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+
+        # Get features from all GPUs to increase negatives for contrastive loss.
+        # These will be lists of tensors with length = world size.
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+
+        # shape: (batch_size * world_size, embed_dim)
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        _rank = self._rank
+
+        # Compute logits for image-text contrastive loss: cosine similarity.
+        image_logits = _scale * image_feats @ all_text_feats.T
+        text_logits = _scale * text_feats @ all_image_feats.T
+
+        # Compute cross entropy loss: we compute log probabilities and take the
+        # diagonal elements as targets: image[i] should match text[i] in batch.
+        # Shift the targets according to rank of GPU process (we assume that all
+        # GPU processes have the same local batch size).
+        loss = self.loss_fn(
+            image_logits, text_logits, _rank, _scale
+        )
+        outputs.append(loss)
+
+        if self.hier_sample_type == HierarchySampleType.ALL.value:
+            # [192 x tensor] + 4 x 192 x tensor --> 5 x 192 x tensor 
+            extra_text_samples = [box_tokens] + transposed_hierarchy_tokens
+        elif self.hier_sample_type == HierarchySampleType.SINGLE_RANDOM.value:
+            random_idx = torch.randint(0, len(transposed_hierarchy_tokens), (1,)).item()
+            extra_text_samples = [box_tokens] + [transposed_hierarchy_tokens[random_idx]]
+        else:
+            raise ValueError(f"Invalid hier_sample_type: {self.hier_sample_type}. Must be either 'ALL' or 'SINGLE_RANDOM'.")
+        # print(f"Outer extra sample  tokens list length: {len(extra_text_samples)}")
+        # print(f"Inner extra sample list length: {len(extra_text_samples[0])}")
+        # print(f"Inner extra sample tokens tensor shape: {extra_text_samples[0][0].shape}")
+        # print(f"Total number of extra samples for a loss pass: {len(extra_text_samples)}")
+
+        box_image_feats = self.encode_image(box_images, project=True)
+
+        # compute loss for the extra samples
+        for txt in extra_text_samples:
+            # shape: (batch_size, embed_dim)
+            txt_feats = self.encode_text(txt, project=True)
+
+            # we consider these all to be 'box' samples:
+            _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
+
+            # Compute logits for image-text contrastive loss: cosine similarity.
+            image_logits = _scale * box_image_feats @ txt_feats.T
+            text_logits = _scale * txt_feats @ box_image_feats.T
+
+            # Compute cross entropy loss: we compute log probabilities and take the
+            # diagonal elements as targets: image[i] should match text[i] in batch.
+            # Shift the targets according to rank of GPU process (we assume that all
+            # GPU processes have the same local batch size).
+            loss = self.loss_fn(
+                image_logits, text_logits, _rank, _scale
+            )
+            outputs.append(loss)
+
+        # loss = 0.5 * (outputs[0]["loss"] + outputs[1]["loss"])
+        
+        # compute average loss and contrastive loss across all samples
+        loss = 0.0
+        contrastive_loss = 0.0
+        for output in outputs:
+            loss += output["loss"]
+            contrastive_loss += output["logging"]["contrastive_loss"]
+        
+        loss /= len(outputs)
+        contrastive_loss /= len(outputs)
+
+# DO NOT FORGET TO ALSO modify MERU INSTANTIATING CLIP because of new input params
+# CHECK line-by-line whats the difference between such this models2 boxes implementation
+# and the without box forward loop for clip. some of the torch operation might be making this much better.
+# we will revert back to train.py from now on, but might use models2.py and losses.py cause its
+# better structured, just make sure forward loop matches line-by-line with the one without boxes in models.py 
+
+        return {
+            "loss": loss,
+            "logging": {
+                "contrastive_loss": contrastive_loss,
                 "logit_scale": _scale,
             },
         }
@@ -255,6 +423,7 @@ class MERU(CLIPBaseline):
     """
     Implementation of MERU model that embeds images and text in a hyperbolic space.
 
+    
     Reference: MERU paper (https://arxiv.org/abs/2304.09172)
     """
 
@@ -267,9 +436,9 @@ class MERU(CLIPBaseline):
         learn_curv: bool = True,
         entail_weight: float = 0.0,
         use_boxes: bool = False,
+        use_hierarchies: bool = False,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
-        use_hierarchies: bool = False,
         loss_fn="meru_loss"
     ):
         """
@@ -280,7 +449,15 @@ class MERU(CLIPBaseline):
             learn_curv: Whether to learn the curvature parameter during training.
             entail_weight: Weight for the entailment loss component.
         """
-        super().__init__(visual, textual, embed_dim, use_boxes, pixel_mean, pixel_std)
+        super().__init__(
+            visual=visual,
+            textual=textual,
+            embed_dim=embed_dim,
+            use_boxes=False,
+            use_hierarchies=False,
+            hier_sample_type=HierarchySampleType.ALL,
+            pixel_mean=pixel_mean,
+            pixel_std=pixel_std)
 
         # Initialize curvature parameter. Hyperboloid curvature will be `-curv`.
         self.curv = nn.Parameter(
@@ -300,7 +477,11 @@ class MERU(CLIPBaseline):
         self.textual_alpha = nn.Parameter(torch.tensor(embed_dim**-0.5).log())
         self.loss_fn = self.get_loss_fn(loss_fn)
         
-        if use_boxes:
+        print(f"INSIDE MERU INIT, USE BOXES AND HIERARCHIES IS SET TO: {use_boxes} and {use_hierarchies}")
+
+        if use_hierarchies:
+            self.forward = self.forward_with_extra_samples
+        elif use_boxes:
             self.forward = self.forward_with_boxes
 
     def encode_image(self, images: torch.Tensor, project: bool):
@@ -397,7 +578,7 @@ class MERU(CLIPBaseline):
             return losses.accept_the_modality_gap_loss
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
-        
+
     def forward_with_boxes(
         self, images: torch.Tensor, box_images: torch.Tensor,
         tokens: list[torch.Tensor], box_tokens: list[torch.Tensor]
@@ -408,6 +589,10 @@ class MERU(CLIPBaseline):
             tokens: List of tensors, each containing text tokens. Tensors may have
                 variable length (they will be padded internally).
         """
+        # box_tokens shape: 192 x tensor
+        
+        # Clamp temperature such that logits are not scaled more than 100x.
+        # ln(100) = ~4.6052
         with torch.no_grad():
             # Clamp scaling factors such that they do not up-scale the feature norms.
             # Once `exp(scale) = 1`, they can simply be removed during inference.
@@ -418,47 +603,246 @@ class MERU(CLIPBaseline):
         _curv = self.curv.exp()
         _scale = self.logit_scale.exp()
 
-        inputs = [(images, tokens, False), (box_images, box_tokens, True)]
         outputs = []
-        for (img, txt, is_box) in inputs:
+        # compute original I-T sample loss
+        # shape: (batch_size, embed_dim)
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+
+        # Get features from all GPUs to increase negatives for contrastive loss.
+        # These will be lists of tensors with length = world size.
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+
+        # shape: (batch_size * world_size, embed_dim)
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        _rank = self._rank
+
+        # Compute cross entropy loss: we compute log probabilities and take the
+        # diagonal elements as targets: image[i] should match text[i] in batch.
+        # Shift the targets according to rank of GPU process (we assume that all
+        # GPU processes have the same local batch size).
+        loss = self.loss_fn(
+            image_feats, text_feats, all_image_feats, all_text_feats, 
+            _curv, _rank, _scale, entail_weight=self.entail_weight
+        )
+        outputs.append(loss)    
+        
+        extra_text_samples = [box_tokens]
+
+        box_image_feats = self.encode_image(box_images, project=True)
+
+        # compute loss for the extra samples
+        for txt in extra_text_samples:
             # shape: (batch_size, embed_dim)
-            image_feats = self.encode_image(img, project=True)
-            text_feats = self.encode_text(txt, project=True)
+            txt_feats = self.encode_text(txt, project=True)
 
-            if is_box:
-                all_image_feats = image_feats
-                all_text_feats = text_feats
-                _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
-            else:
-                # Get features from all GPUs to increase negatives for contrastive loss.
-                # These will be lists of tensors with length = world size.
-                all_image_feats = dist.gather_across_processes(image_feats)
-                all_text_feats = dist.gather_across_processes(text_feats)
+            # we consider these all to be 'box' samples:
+            _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
 
-                # shape: (batch_size * world_size, embed_dim)
-                all_image_feats = torch.cat(all_image_feats, dim=0)
-                all_text_feats = torch.cat(all_text_feats, dim=0)
-                _rank = self._rank
-    
-            # Compute all necessary loss components. All the loss functions in losses.py
-            # are decorated with autocast to force a higher precision.
+            # Compute cross entropy loss: we compute log probabilities and take the
+            # diagonal elements as targets: image[i] should match text[i] in batch.
+            # Shift the targets according to rank of GPU process (we assume that all
+            # GPU processes have the same local batch size).
             loss = self.loss_fn(
-                image_feats, text_feats, all_image_feats, all_text_feats, 
+                box_image_feats, txt_feats, image_feats, text_feats, 
                 _curv, _rank, _scale, entail_weight=self.entail_weight
             )
             outputs.append(loss)
-
-        loss = 0.5 * (outputs[0]["loss"] + outputs[1]["loss"])
+        
+        # compute average loss and its components across all samples
+        loss = 0.0
+        contrastive_loss = 0.0
+        entailment_loss = 0.0
+        for output in outputs:
+            loss += output["loss"]
+            contrastive_loss += output["logging"]["contrastive_loss"]
+            entailment_loss += output["logging"]["entailment_loss"]
+        
+        loss /= len(outputs)
+        contrastive_loss /= len(outputs)
+        entailment_loss /= len(outputs)
 
         return {
             "loss": loss,
             "logging": {
-                "contrastive_loss": 0.5 * (outputs[0]["logging"]["contrastive_loss"] + outputs[1]["logging"]["contrastive_loss"]),
-                "entailment_loss": 0.5 * (outputs[0]["logging"]["entailment_loss"] + outputs[1]["logging"]["entailment_loss"]),
+                "contrastive_loss": contrastive_loss,
+                "entailment_loss": entailment_loss,
                 "logit_scale": _scale,
                 "curv": _curv,
             },
         }
+    
+    # def forward_with_boxes(
+    #     self, images: torch.Tensor, box_images: torch.Tensor,
+    #     tokens: list[torch.Tensor], box_tokens: list[torch.Tensor]
+    # ) -> dict[str, torch.Tensor]:
+    #     """
+    #     Args:
+    #         images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+    #         tokens: List of tensors, each containing text tokens. Tensors may have
+    #             variable length (they will be padded internally).
+    #     """
+    #     with torch.no_grad():
+    #         # Clamp scaling factors such that they do not up-scale the feature norms.
+    #         # Once `exp(scale) = 1`, they can simply be removed during inference.
+    #         self.visual_alpha.clamp_(max=0.0)
+    #         self.textual_alpha.clamp_(max=0.0)
+    #         self.logit_scale.clamp_(max=4.6052)
+    #         self.curv.clamp_(**self._curv_minmax)
+    #     _curv = self.curv.exp()
+    #     _scale = self.logit_scale.exp()
+
+    #     inputs = [(images, tokens, False), (box_images, box_tokens, True)]
+    #     outputs = []
+    #     for (img, txt, is_box) in inputs:
+    #         # shape: (batch_size, embed_dim)
+    #         image_feats = self.encode_image(img, project=True)
+    #         text_feats = self.encode_text(txt, project=True)
+
+    #         if is_box:
+    #             all_image_feats = image_feats
+    #             all_text_feats = text_feats
+    #             _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
+    #         else:
+    #             # Get features from all GPUs to increase negatives for contrastive loss.
+    #             # These will be lists of tensors with length = world size.
+    #             all_image_feats = dist.gather_across_processes(image_feats)
+    #             all_text_feats = dist.gather_across_processes(text_feats)
+
+    #             # shape: (batch_size * world_size, embed_dim)
+    #             all_image_feats = torch.cat(all_image_feats, dim=0)
+    #             all_text_feats = torch.cat(all_text_feats, dim=0)
+    #             _rank = self._rank
+    
+    #         # Compute all necessary loss components. All the loss functions in losses.py
+    #         # are decorated with autocast to force a higher precision.
+    #         loss = self.loss_fn(
+    #             image_feats, text_feats, all_image_feats, all_text_feats, 
+    #             _curv, _rank, _scale, entail_weight=self.entail_weight
+    #         )
+    #         outputs.append(loss)
+
+    #     loss = 0.5 * (outputs[0]["loss"] + outputs[1]["loss"])
+
+    #     return {
+    #         "loss": loss,
+    #         "logging": {
+    #             "contrastive_loss": 0.5 * (outputs[0]["logging"]["contrastive_loss"] + outputs[1]["logging"]["contrastive_loss"]),
+    #             "entailment_loss": 0.5 * (outputs[0]["logging"]["entailment_loss"] + outputs[1]["logging"]["entailment_loss"]),
+    #             "logit_scale": _scale,
+    #             "curv": _curv,
+    #         },
+    #     }
+
+    def forward_with_extra_samples(
+        self, images: torch.Tensor, box_images: torch.Tensor,
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor],
+        hierarchy_tokens: list[list[torch.Tensor]], pairwise_scores: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+            tokens: List of tensors, each containing text tokens. Tensors may have
+                variable length (they will be padded internally).
+        """
+        # box_tokens shape: 192 x tensor
+        
+        # Clamp temperature such that logits are not scaled more than 100x.
+        # ln(100) = ~4.6052
+        with torch.no_grad():
+            # Clamp scaling factors such that they do not up-scale the feature norms.
+            # Once `exp(scale) = 1`, they can simply be removed during inference.
+            self.visual_alpha.clamp_(max=0.0)
+            self.textual_alpha.clamp_(max=0.0)
+            self.logit_scale.clamp_(max=4.6052)
+            self.curv.clamp_(**self._curv_minmax)
+        _curv = self.curv.exp()
+        _scale = self.logit_scale.exp()
+
+        # first we need to transpose the 192 x 4 x tensor to be 4 x 192 x tensor
+        transposed_hierarchy_tokens = [[row[i] for row in hierarchy_tokens] for i in range(len(hierarchy_tokens[0]))]
+        # print(f"Outer T hier tokens list length: {len(transposed_hierarchy_tokens)}")
+        # print(f"Inner T hier tokens list length: {len(transposed_hierarchy_tokens[0])}")
+        # print(f"Inner Inner T hier tokens tensor shape: {transposed_hierarchy_tokens[0][0].shape}")
+        
+        outputs = []
+        # compute original I-T sample loss
+        # shape: (batch_size, embed_dim)
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+
+        # Get features from all GPUs to increase negatives for contrastive loss.
+        # These will be lists of tensors with length = world size.
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+
+        # shape: (batch_size * world_size, embed_dim)
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        _rank = self._rank
+
+        # Compute cross entropy loss: we compute log probabilities and take the
+        # diagonal elements as targets: image[i] should match text[i] in batch.
+        # Shift the targets according to rank of GPU process (we assume that all
+        # GPU processes have the same local batch size).
+        loss = self.loss_fn(
+            image_feats, text_feats, all_image_feats, all_text_feats, 
+            _curv, _rank, _scale, entail_weight=self.entail_weight
+        )
+        outputs.append(loss)    
+        
+        # [192 x tensor] + 4 x 192 x tensor --> 5 x 192 x tensor 
+        extra_text_samples = [box_tokens] + transposed_hierarchy_tokens
+        # print(f"Outer extra sample  tokens list length: {len(extra_text_samples)}")
+        # print(f"Inner extra sample list length: {len(extra_text_samples[0])}")
+        # print(f"Inner extra sample tokens tensor shape: {extra_text_samples[0][0].shape}")
+        # print(f"Total number of extra samples for a loss pass: {len(extra_text_samples)}")
+
+        box_image_feats = self.encode_image(box_images, project=True)
+
+        # compute loss for the extra samples
+        for txt in extra_text_samples:
+            # shape: (batch_size, embed_dim)
+            txt_feats = self.encode_text(txt, project=True)
+
+            # we consider these all to be 'box' samples:
+            _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
+
+            # Compute cross entropy loss: we compute log probabilities and take the
+            # diagonal elements as targets: image[i] should match text[i] in batch.
+            # Shift the targets according to rank of GPU process (we assume that all
+            # GPU processes have the same local batch size).
+            loss = self.loss_fn(
+                box_image_feats, txt_feats, image_feats, text_feats, 
+                _curv, _rank, _scale, entail_weight=self.entail_weight
+            )
+            outputs.append(loss)
+        
+        # compute average loss and its components across all samples
+        loss = 0.0
+        contrastive_loss = 0.0
+        entailment_loss = 0.0
+        for output in outputs:
+            loss += output["loss"]
+            contrastive_loss += output["logging"]["contrastive_loss"]
+            entailment_loss += output["logging"]["entailment_loss"]
+        
+        loss /= len(outputs)
+        contrastive_loss /= len(outputs)
+        entailment_loss /= len(outputs)
+
+        return {
+            "loss": loss,
+            "logging": {
+                "contrastive_loss": contrastive_loss,
+                "entailment_loss": entailment_loss,
+                "logit_scale": _scale,
+                "curv": _curv,
+            },
+        }
+    
 
 class HyCoCLIP(MERU):
     """
@@ -475,6 +859,8 @@ class HyCoCLIP(MERU):
         learn_curv: bool = True,
         entail_weight: float = 0.0,
         use_boxes: bool = True,
+        use_hierarchies: bool = False,
+        hier_sample_type: HierarchySampleType = HierarchySampleType.ALL,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         loss_fn="hycoclip_loss"
@@ -485,18 +871,35 @@ class HyCoCLIP(MERU):
         Args:
             use_boxes: Whether to use box images and texts for training.
         """
-        super().__init__(visual=visual, textual=textual, embed_dim=embed_dim, curv_init=curv_init, learn_curv=learn_curv, entail_weight=entail_weight,
+        super().__init__(visual=visual,
+                        textual=textual,
+                        embed_dim=embed_dim,
+                        curv_init=curv_init,
+                        learn_curv=learn_curv,
+                        entail_weight=entail_weight,
                         use_boxes=False,
-                        pixel_mean=pixel_mean, pixel_std=pixel_std,
                         use_hierarchies=False,
+                        pixel_mean=pixel_mean,
+                        pixel_std=pixel_std,
                         loss_fn=loss_fn)
-        
+    
         assert use_boxes, "HyCoCLIP requires box images and texts to function."
+
+        self.hier_sample_type = hier_sample_type
+
+        print(f"Initialized HyCoCLIP with loss function: {loss_fn}")
+        print(f"Use boxes: {use_boxes}, Use hierarchies: {use_hierarchies}")
+
+        if use_hierarchies:
+            print(f"Hierarchy sample type set to: {hier_sample_type}")
+            self.forward = self.forward_with_extra_samples
+
         self.loss_fn = self.get_loss_fn(loss_fn)
+
 
     def forward(
         self, images: torch.Tensor, box_images: torch.Tensor,
-        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor], angle_thr_factor:float=1.0
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor]
     ) -> dict[str, torch.Tensor]:
         """
         Args:
@@ -543,6 +946,229 @@ class HyCoCLIP(MERU):
         
         return loss
     
+    def forward_with_extra_samples(
+        self, images: torch.Tensor, box_images: torch.Tensor,
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor],
+        hierarchy_tokens: list[list[torch.Tensor]], pairwise_scores: torch.Tensor
+    ) -> dict[str, torch.Tensor]:
+        """
+        Args:
+            images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+            tokens: List of tensors, each containing text tokens. Tensors may have
+                variable length (they will be padded internally).
+        """
+        with torch.no_grad():
+            # Clamp scaling factors such that they do not up-scale the feature norms.
+            # Once `exp(scale) = 1`, they can simply be removed during inference.
+            self.visual_alpha.clamp_(max=0.0)
+            self.textual_alpha.clamp_(max=0.0)
+            # Clamp the curvature parameter to prevent instability.
+            self.curv.clamp_(**self._curv_minmax)
+            # Clamp temperature such that logits are not scaled more than 100x.
+            # ln(100) = ~4.6052
+            self.logit_scale.clamp_(max=4.6052)
+        _curv = self.curv.exp()
+        _scale = self.logit_scale.exp()
+
+        # first we need to transpose the 192 x 4 x tensor to be 4 x 192 x tensor
+        transposed_hierarchy_tokens = [[row[i] for row in hierarchy_tokens] for i in range(len(hierarchy_tokens[0]))]
+        # print(f"Outer T hier tokens list length: {len(transposed_hierarchy_tokens)}")
+        # print(f"Inner T hier tokens list length: {len(transposed_hierarchy_tokens[0])}")
+        # print(f"Inner Inner T hier tokens tensor shape: {transposed_hierarchy_tokens[0][0].shape}")
+
+        # compute hierarchy features. shape: (4, batch_size, embed_dim)
+        hierarchy_feats_list = [self.encode_text(txt, project=True) for txt in transposed_hierarchy_tokens]
+
+        # shape: (batch_size, embed_dim)
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+
+        box_image_feats = self.encode_image(box_images, project=True)
+        box_text_feats = self.encode_text(box_tokens, project=True)
+
+        # Get features from all GPUs to increase negatives for contrastive loss.
+        # These will be lists of tensors with length = world size.
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+
+        # shape: (batch_size * world_size, embed_dim)
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+
+        # Compute all necessary loss components. All the loss functions in losses.py
+        # are decorated with autocast to force a higher precision.
+        loss = self.loss_fn(
+            image_feats, text_feats, box_image_feats, box_text_feats, hierarchy_feats_list, self.hier_sample_type,
+            all_image_feats, all_text_feats, _curv, self._rank, _scale,
+            entail_weight=self.entail_weight,
+        )
+        
+        return loss
+
+    # def forward_with_extra_samples(
+    #     self, images: torch.Tensor, box_images: torch.Tensor,
+    #     tokens: list[torch.Tensor], box_tokens: list[torch.Tensor],
+    #     hierarchy_tokens: list[list[torch.Tensor]], pairwise_scores: torch.Tensor
+    # ) -> dict[str, torch.Tensor]:
+    #     """
+    #     Args:
+    #         images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+    #         tokens: List of tensors, each containing text tokens. Tensors may have
+    #             variable length (they will be padded internally).
+    #     """
+    #     print("Forwarding with extra hierarchy samples! ")
+
+    #     with torch.no_grad():
+    #         # Clamp scaling factors such that they do not up-scale the feature norms.
+    #         # Once `exp(scale) = 1`, they can simply be removed during inference.
+    #         self.visual_alpha.clamp_(max=0.0)
+    #         self.textual_alpha.clamp_(max=0.0)
+    #         # Clamp the curvature parameter to prevent instability.
+    #         self.curv.clamp_(**self._curv_minmax)
+    #         # Clamp temperature such that logits are not scaled more than 100x.
+    #         # ln(100) = ~4.6052
+    #         self.logit_scale.clamp_(max=4.6052)
+    #     _curv = self.curv.exp()
+    #     _scale = self.logit_scale.exp()
+
+    #     # first we need to transpose the 192 x 4 x tensor to be 4 x 192 x tensor
+    #     transposed_hierarchy_tokens = [[row[i] for row in hierarchy_tokens] for i in range(len(hierarchy_tokens[0]))]
+    #     # print(f"Outer T hier tokens list length: {len(transposed_hierarchy_tokens)}")
+    #     # print(f"Inner T hier tokens list length: {len(transposed_hierarchy_tokens[0])}")
+    #     # print(f"Inner Inner T hier tokens tensor shape: {transposed_hierarchy_tokens[0][0].shape}")
+        
+    #     outputs = []
+
+    #     # shape: (batch_size, embed_dim)
+    #     image_feats = self.encode_image(images, project=True)
+    #     text_feats = self.encode_text(tokens, project=True)
+
+    #     box_image_feats = self.encode_image(box_images, project=True)
+    #     box_text_feats = self.encode_text(box_tokens, project=True)
+
+    #     # Get features from all GPUs to increase negatives for contrastive loss.
+    #     # These will be lists of tensors with length = world size.
+    #     all_image_feats = dist.gather_across_processes(image_feats)
+    #     all_text_feats = dist.gather_across_processes(text_feats)
+
+    #     # shape: (batch_size * world_size, embed_dim)
+    #     all_image_feats = torch.cat(all_image_feats, dim=0)
+    #     all_text_feats = torch.cat(all_text_feats, dim=0)
+
+    #     print("Forwarding with extra hierarchy samples! 2")
+
+    #     # Compute all necessary loss components. All the loss functions in losses.py
+    #     # are decorated with autocast to force a higher precision.
+    #     loss = self.loss_fn(
+    #         image_feats, text_feats, box_image_feats, box_text_feats,
+    #         all_image_feats, all_text_feats, _curv, self._rank, _scale,
+    #         entail_weight=self.entail_weight
+    #     )
+    #     outputs.append(loss)    
+        
+    #     print("Forwarding with extra hierarchy samples 3! ")
+
+    #     # [192 x tensor] + 4 x 192 x tensor --> 5 x 192 x tensor 
+    #     if self.hier_sample_type == HierarchySampleType.ALL.value:
+    #         # [192 x tensor] + 4 x 192 x tensor --> 5 x 192 x tensor 
+    #         extra_text_samples = transposed_hierarchy_tokens #[box_tokens] + transposed_hierarchy_tokens
+    #     elif self.hier_sample_type == HierarchySampleType.SINGLE_RANDOM.value:
+    #         random_idx = torch.randint(0, len(transposed_hierarchy_tokens), (1,)).item()
+    #         extra_text_samples = transposed_hierarchy_tokens[random_idx] #[box_tokens] + [transposed_hierarchy_tokens[random_idx]]
+    #     else:
+    #         raise ValueError(f"Invalid hier_sample_type: {self.hier_sample_type}. Must be either 'ALL' or 'SINGLE_RANDOM'.")
+    #     # print(f"Outer extra sample  tokens list length: {len(extra_text_samples)}")
+    #     # print(f"Inner extra sample list length: {len(extra_text_samples[0])}")
+    #     # print(f"Inner extra sample tokens tensor shape: {extra_text_samples[0][0].shape}")
+    #     # print(f"Total number of extra samples for a loss pass: {len(extra_text_samples)}")
+
+    #     box_image_feats = self.encode_image(box_images, project=True)
+
+    #     # compute loss for the extra samples
+    #     for txt in extra_text_samples:
+    #         # shape: (batch_size, embed_dim)
+    #         extra_txt_feats = self.encode_text(txt, project=True)
+
+    #         # we consider these all to be 'box' samples:
+    #         _rank = 0 # use this to get the local targets, i.e., don't use samples from other GPUs as negatives
+
+    #         # Compute cross entropy loss: we compute log probabilities and take the
+    #         # diagonal elements as targets: image[i] should match text[i] in batch.
+    #         # Shift the targets according to rank of GPU process (we assume that all
+    #         # GPU processes have the same local batch size).
+    #         loss = self.loss_fn(
+    #             image_feats, text_feats, box_image_feats, extra_txt_feats,
+    #             all_image_feats, all_text_feats, _curv, _rank, _scale,
+    #             entail_weight=self.entail_weight
+    #         )
+    #         outputs.append(loss)
+        
+    #     print("Forwarding with extra hierarchy samples! 4")
+
+    #     # compute average loss and logging stats across all samples
+    #     n = len(outputs)
+    #     # loss = 0.0
+    #     # contrastive_loss = 0.0
+    #     # entailment_loss = 0.0
+    #     # text_image_entailment_loss = 0.0
+    #     # box_text_image_entailment_loss = 0.0
+    #     # cross_image_entailment_loss = 0.0
+    #     # cross_text_entailment_loss = 0.0
+        
+    #     # for output in outputs:
+    #     #     loss += output["loss"]
+    #     #     contrastive_loss += output["logging"]["contrastive_loss"]
+    #     #     entailment_loss += output["logging"]["entailment_loss"]
+    #     #     text_image_entailment_loss += output["logging"]["text_image_entailment_loss"]
+    #     #     box_text_image_entailment_loss += output["logging"]["box_text_image_entailment_loss"]
+    #     #     cross_image_entailment_loss += output["logging"]["cross_image_entailment_loss"]
+    #     #     cross_text_entailment_loss += output["logging"]["cross_text_entailment_loss"]
+        
+    #     # loss /= n
+    #     # contrastive_loss /= n
+    #     # entailment_loss /= n
+    #     # text_image_entailment_loss /= n
+    #     # box_text_image_entailment_loss /= n
+    #     # cross_image_entailment_loss /= n
+    #     # cross_text_entailment_loss /= n
+
+    #     loss = sum(o["loss"] for o in outputs) / n
+    #     # average each logged component in one comprehension
+    #     avg_logs = {
+    #         key: sum(o["logging"][key] for o in outputs) / n
+    #         for key in (
+    #             "contrastive_loss",
+    #             "entailment_loss",
+    #             "text_image_entailment_loss",
+    #             "box_text_image_entailment_loss",
+    #             "cross_image_entailment_loss",
+    #             "cross_text_entailment_loss",
+    #         )
+    #     }
+    #     contrastive_loss = avg_logs["contrastive_loss"]
+    #     entailment_loss = avg_logs["entailment_loss"]
+    #     text_image_entailment_loss = avg_logs["text_image_entailment_loss"]
+    #     box_text_image_entailment_loss = avg_logs["box_text_image_entailment_loss"]
+    #     cross_image_entailment_loss = avg_logs["cross_image_entailment_loss"]
+    #     cross_text_entailment_loss = avg_logs["cross_text_entailment_loss"]
+
+    #     print("Forwarding with extra hierarchy samples! 5")
+
+    #     return {
+    #         "loss": loss,
+    #         "logging": {
+    #             "contrastive_loss": contrastive_loss,
+    #             "text_image_entailment_loss": text_image_entailment_loss,
+    #             "box_text_image_entailment_loss": box_text_image_entailment_loss,
+    #             "cross_image_entailment_loss": cross_image_entailment_loss,
+    #             "cross_text_entailment_loss": cross_text_entailment_loss,
+    #             "entailment_loss": entailment_loss,
+    #             "logit_scale": _scale,
+    #             "curv": _curv,
+    #         },
+    #     }
+        
+
     def get_loss_fn(self, loss_fn_name: str):
         """
         Returns the loss function based on the provided name.
@@ -551,6 +1177,8 @@ class HyCoCLIP(MERU):
             return losses.hycoclip_loss
         elif loss_fn_name == "chordclip_loss":
             return losses.chordclip_loss
+        elif loss_fn_name == "hycoclip_deep_loss":
+            return losses.hycoclip_deep_loss
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
         
@@ -582,11 +1210,10 @@ class HyCoCLIP_Re_Weight(MERU):
         curv_init: float = 1.0,
         learn_curv: bool = True,
         entail_weight: float = 0.0,
-        use_boxes: bool = True,
+        contrast_weight: float = 1.0,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         use_hierarchies: bool = True,
-        hier_distance_weight: float = 0.0,
         loss_fn="hyco_reweight_loss"
     ):
         """
@@ -595,11 +1222,23 @@ class HyCoCLIP_Re_Weight(MERU):
         Args:
             use_boxes: Whether to use box images and texts for training.
         """
-        super().__init__(visual=visual, textual=textual, embed_dim=embed_dim, curv_init=curv_init, learn_curv=learn_curv, entail_weight=entail_weight, use_boxes=False, pixel_mean=pixel_mean, pixel_std=pixel_std, loss_fn=loss_fn)
-        assert use_boxes, "HyCoCLIP requires box images and texts to function."
+        super().__init__(visual=visual,
+                         textual=textual,
+                         embed_dim=embed_dim,
+                         curv_init=curv_init,
+                         learn_curv=learn_curv,
+                         entail_weight=entail_weight,
+                         use_boxes=False,
+                         use_hierarchies=False,
+                         pixel_mean=pixel_mean,
+                         pixel_std=pixel_std,
+                         loss_fn=loss_fn)
+        
         assert use_hierarchies, "HyCoCLIP ReWeight requires textual hierarchies to function."
-        self.hier_distance_weight = hier_distance_weight
+        self.contrast_weight = contrast_weight
         self.loss_fn = self.get_loss_fn(loss_fn)
+
+        print(f"INSIDE RE WEIGHT INIT, USE HIERARCHIES IS SET TO: {use_hierarchies}")
 
     def forward(
         self, images: torch.Tensor, box_images: torch.Tensor,
@@ -632,8 +1271,17 @@ class HyCoCLIP_Re_Weight(MERU):
         box_image_feats = self.encode_image(box_images, project=True)
         box_text_feats = self.encode_text(box_tokens, project=True)
 
+        # first we need to transpose the 192 x 4 x tensor to be 4 x 192 x tensor
+        transposed_hier_tokens = [[row[i] for row in hierarchy_tokens] for i in range(len(hierarchy_tokens[0]))]
         # compute hierarchy features
-        hierarchy_feats = [text_feats] + [self.encode_text([hier[i] for hier in hierarchy_tokens], project=True) for i in range(4)]
+        hierarchy_feats = [self.encode_text(transposed_hier_tokens[i], project=True) for i in range(len(transposed_hier_tokens))]
+        # old, probably incorrect:
+        # hierarchy_feats = [self.encode_text([hier[i] for hier in hierarchy_tokens], project=True) for i in range(4)]
+
+        # transpose the 192 x 4 pairwise scores tensor to be 4 x 192 tensor
+        pairwise_scores = pairwise_scores.T
+        # print(f"PAIRWISE SCORE SHAPE: {pairwise_scores.shape}")
+        # print(f"PAIRWISE SCORE SHAPE: {pairwise_scores[0].shape}")
 
         # Get features from all GPUs to increase negatives for contrastive loss.
         # These will be lists of tensors with length = world size.
@@ -649,7 +1297,7 @@ class HyCoCLIP_Re_Weight(MERU):
         loss = self.loss_fn(
             image_feats, text_feats, box_image_feats, box_text_feats,
             all_image_feats, all_text_feats, hierarchy_feats, pairwise_scores, _curv, self._rank, _scale,
-            entail_weight=self.entail_weight, hier_distance_weight=self.hier_distance_weight
+            entail_weight=self.entail_weight, contrast_weight=self.contrast_weight
         )
         
         return loss

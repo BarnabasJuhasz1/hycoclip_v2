@@ -142,6 +142,9 @@ class ImageTextWebDataset(IterableDataset):
         pipeline.append(wds.decode("pil", handler=wds.warn_and_continue))
         pipeline.append(wds.select(check_parent_keys))  # Ensure all parent keys are present.
         pipeline.append(wds.map(self.mapper))
+        # If a mapper returns a list of samples (to emit multiple samples per input),
+        # flatten them into individual samples here.
+        pipeline.append(wds.flatmap(lambda x: x if isinstance(x, list) else [x]))
 
         if self.infinite_stream:
             # Sample an infinite stream of dataset dicts.
@@ -196,16 +199,10 @@ class ExtendedGroundedDatasetTarMapper:
             T.CenterCrop(224),
             T.ToTensor(),
         ],
-        # use_extra_hierarchy_samples: bool = False,
-        use_proposed_hierachies: bool = False,
     ):
         """
         Args:
             image_transform: List of image transformations from torchvision.
-            use_extra_hierarchy_samples: If True, emit 5 (for CLIP/MERU) or 4 (for HyCoCLIP) additional sample for every
-                input sample where `box_text` is replaced by an element
-                from the sample's `text_hierarchy` (excluding the first element
-                which equals the original box text).
         """
         self.image_transform = T.Compose(image_transform)
         self.annotation_loader = JsonAnnotationLoader(
@@ -213,8 +210,6 @@ class ExtendedGroundedDatasetTarMapper:
             annotation_key="text_hierarchy",
             max_cache_size=100
         )
-        # self.use_extra_hierarchy_samples = use_extra_hierarchy_samples
-        self.use_proposed_hierachies = use_proposed_hierachies
 
     def __call__(self, dataset_dict: dict):
         num_boxes = int(dataset_dict["numparents.txt"])
@@ -222,18 +217,7 @@ class ExtendedGroundedDatasetTarMapper:
         dataset_dict = self.annotation_loader(dataset_dict)
 
         parent_id = f"parent{random_box:03d}"
-
-        # decide whether to use proposed hierarchies or original ones
-        if self.use_proposed_hierachies:
-            # use proposed if available, otherwise fallback to original
-            if "proposed" in dataset_dict["text_hierarchy"][parent_id]:
-                parent_original = dataset_dict["text_hierarchy"][parent_id]["proposed"]
-            else:
-                parent_original = dataset_dict["text_hierarchy"][parent_id]["original"]
-        else:
-            # use original hierarchies
-            parent_original = dataset_dict["text_hierarchy"][parent_id]["original"]
-
+        parent_original = dataset_dict["text_hierarchy"][parent_id]["original"]
         # skip the first element of hierarchy because it is equal to the parent box text
         hierarchy_list = parent_original.get("hierarchy", [])[1:]
 
@@ -247,19 +231,25 @@ class ExtendedGroundedDatasetTarMapper:
             "scores": np.array([parent_original["pairwise_scores"][str(i)]["final_score"]
                        for i in range(len(parent_original["pairwise_scores"]))], dtype=np.float32),
         }
-    
-        # if not self.use_extra_hierarchy_samples:
-        return orig
 
-        # does not work, because the iterable expects a single dictionary not a list of dictionaries
+        if not self.add_hierarchy_extra:
+            return orig
 
-        # # return a list of 5 samples for each element in hierarchy (original + 4 extra)
-        # extra_hierarchies = [copy.deepcopy(orig) for _ in range(len(hierarchy_list))]
-        # for i, extra in enumerate(extra_hierarchies):
-        #     extra["box_text"] = hierarchy_list[i]
+        # Create an extra sample where box_text is a random element from the hierarchy
+        if hierarchy_list:
+            if self.extra_seed is not None:
+                rng = random.Random(self.extra_seed + (hash(dataset_dict.get("__key__", "")) & 0xFFFFFFFF))
+                new_box_text = rng.choice(hierarchy_list)
+            else:
+                new_box_text = random.choice(hierarchy_list)
+        else:
+            new_box_text = orig["box_text"]
 
-        # return [orig] + extra_hierarchies
+        extra = copy.deepcopy(orig)
+        extra["box_text"] = new_box_text
+        extra["is_extra"] = True
 
+        return [orig, extra]
 
 
 

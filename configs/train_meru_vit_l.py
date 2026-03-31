@@ -16,6 +16,12 @@ from hycoclip.models2 import MERU
 from .train_hycoclip_vit_l import dataset, optim, train
 
 
+# dataset.mapper.use_extra_hierarchy_samples = False
+
+# NOT using proposed hierarchies by default
+dataset.mapper.use_proposed_hierachies = False
+
+
 model = L(MERU)(
     visual=L(build_timm_vit)(
         arch="vit_large_patch16_224",
@@ -29,7 +35,7 @@ model = L(MERU)(
     curv_init=1.0,
     learn_curv=True,
     entail_weight=0.2,
-    use_boxes=True, # USING BOXES
-    use_hierarchies=False,
+    use_boxes=False, # NOT using boxes by default
+    use_hierarchies = False, # NOT using Deep-GRIT hierarchies by default
     loss_fn="meru_loss", # or "meru_loss",
 )

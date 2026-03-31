@@ -14,6 +14,11 @@ from hycoclip.models2 import CLIPBaseline
 from .train_hycoclip_vit_l import dataset, optim, train
 
 
+# NOT using Deep-GRIT hierarchies by default
+# dataset.mapper.use_hierarchies = False
+# NOT using proposed hierarchies by default
+dataset.mapper.use_proposed_hierachies = False
+
 model = L(CLIPBaseline)(
     visual=L(build_timm_vit)(
         arch="vit_large_patch16_224",
@@ -24,7 +29,9 @@ model = L(CLIPBaseline)(
         arch="L12_W512", vocab_size=49408, context_length=77
     ),
     embed_dim=512,
-    use_boxes=True,
+    use_boxes=False, # NOT using boxes by default
+    use_hierarchies = False, # NOT using Deep-GRIT hierarchies by default
+    hier_sample_type = "SINGLE_RANDOM",
     loss_fn="clip_loss"
 )
 

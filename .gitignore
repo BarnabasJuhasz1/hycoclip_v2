@@ -47,11 +47,14 @@ output/
 train_results/
 train_results
 jobs/
-visualizations/
+visualizations_old/
 wandb/
 finetuning/
 unsloth_compiled_cache/
 saved_embeddings/
+# random GRIT samples
+random_sample_output/
+Hierarchical_Experiments/
 
 # vim stuff
 *.swp
@@ -60,6 +63,6 @@ saved_embeddings/
 *.out
 *.job
 
-
 # detached sub-repo
 VL-CheckList/
+
