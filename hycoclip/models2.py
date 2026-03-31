@@ -1307,7 +1307,11 @@ class HyCoCLIP_Re_Weight(MERU):
         Returns the loss function based on the provided name.
         """
         if loss_fn_name == "hyco_reweight_loss":
-            return losses.hyco_reweight_loss
+            return losses.hyco_reweight_loss 
+        elif loss_fn_name == "hyco_reweight_slightly_smaller_K_loss":
+            return losses.hyco_reweight_loss_slightly_smaller_K # FOR TESTING K 
+        elif loss_fn_name == "hyco_reweight_very_small_K_loss":
+            return losses.hyco_reweight_loss_very_small_K # FOR TESTING K 
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
         
