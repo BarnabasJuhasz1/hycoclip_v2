@@ -593,6 +593,64 @@ class HyCoCLIP(MERU):
     #     }
 
 
+class HyCoCLIP_Repulsion(HyCoCLIP):
+    """
+    HyCoCLIP variant with repulsion loss for improved spatial separation
+    of box-level embeddings in hyperbolic space.
+    """
+
+    def __init__(
+        self,
+        visual: nn.Module,
+        textual: TransformerTextEncoder,
+        embed_dim: int,
+        curv_init: float = 1.0,
+        learn_curv: bool = True,
+        entail_weight: float = 0.0,
+        repulsion_weight: float = 0.1,
+        use_boxes: bool = True,
+        use_hierarchies: bool = False,
+        loss_fn: str = "hycoclip_loss_repulsion",
+        pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
+        pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
+    ):
+        """
+        Args:
+            repulsion_weight: Weight for the repulsion loss component that encourages
+                spatial separation of box embeddings.
+            use_hierarchies: Whether to use hierarchical structure (typically False for repulsion).
+            loss_fn: Name of the loss function to use.
+            Other args are the same as HyCoCLIP.
+        """
+        super().__init__(
+            visual, textual, embed_dim, curv_init, learn_curv, 
+            entail_weight, use_boxes, pixel_mean, pixel_std
+        )
+        self.repulsion_weight = repulsion_weight
+        self.use_hierarchies = use_hierarchies
+        self.loss_fn_name = loss_fn
+    
+    def get_loss_fn(self, loss_fn_name: str):
+        """
+        Returns the loss function based on the provided name.
+        For repulsion loss, creates a wrapper that passes the repulsion_weight.
+        """
+        from functools import partial
+        from hycoclip import losses
+        
+        if loss_fn_name == "hycoclip_loss_repulsion":
+            # Create a partial function with repulsion_weight pre-filled
+            return partial(losses.hycoclip_loss_repulsion, repulsion_weight=self.repulsion_weight)
+        elif loss_fn_name == "hycoclip_loss":
+            return losses.hycoclip_loss
+        elif loss_fn_name == "chordclip_loss":
+            return losses.chordclip_loss
+        elif loss_fn_name == "hycoclip_deep_loss":
+            return losses.hycoclip_deep_loss
+        else:
+            raise ValueError(f"Unknown loss function: {loss_fn_name}.")
+
+
 class HyCoCLIP_Re_Weight(MERU):
     """
     Our HyCoCLIP_Re_Weight model, that modifies MERU to embed images, texts,

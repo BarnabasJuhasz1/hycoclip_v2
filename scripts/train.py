@@ -36,7 +36,7 @@ from hycoclip.new_models.re_weight_DinContrastive import HyCoCLIP_Re_Weight_DinC
 from hycoclip.new_models.re_weight_withoutD import HyCoCLIP_Re_Weight_withoutD
 
 
-from finetuning.wandb import initialize_wandb_logger 
+# from finetuning.wandb import initialize_wandb_logger 
 
 #Disable Huggingface’s online requests
 import os
@@ -97,7 +97,7 @@ def main(_A: argparse.Namespace):
     _C = LazyConfig.apply_overrides(_C, _A.overrides)
     
     # Initialize WandDB logger
-    wandb = initialize_wandb_logger(_C)
+    # wandb = initialize_wandb_logger(_C)
 
     # Get process rank and world size (assuming distributed is initialized).
     RANK = dist.get_rank()
@@ -244,7 +244,7 @@ def main(_A: argparse.Namespace):
 
             logger.info(log_str)
             # Log metrics to wandb.
-            wandb.log(output_dict["logging"])
+            # wandb.log(output_dict["logging"])
 
             if dist.is_main_process():
                 tboard.add_scalar("lr", scheduler.get_last_lr()[0], iteration)
@@ -260,7 +260,7 @@ def main(_A: argparse.Namespace):
     if dist.is_main_process():
         checkpoint_manager.final_step()
         # Finish the run and upload any remaining data.
-        wandb.finish()
+        # wandb.finish()
 
 if __name__ == "__main__":
     _A = parser.parse_args()

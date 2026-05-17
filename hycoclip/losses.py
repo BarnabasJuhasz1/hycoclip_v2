@@ -160,6 +160,42 @@ def hycoclip_loss(image_feats, text_feats, box_image_feats, box_text_feats, all_
 
 
 @torch.autocast(device_type=_device_type, dtype=_cast_dtype, enabled=_enable_autocast)
+def hycoclip_loss_repulsion(image_feats, text_feats, box_image_feats, box_text_feats, all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight=1.0, repulsion_weight=0.1):
+    """
+    Computes the HyCoCLIP loss with repulsion term to push box embeddings apart.
+    Repulsion loss: repulsion_weight * e^(-r) where r is the norm of box embeddings.
+    """
+    # Get standard HyCoCLIP loss
+    base_loss = hycoclip_loss(image_feats, text_feats, box_image_feats, box_text_feats, 
+                               all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight)
+    
+    # Compute repulsion loss: penalize when embeddings are close (small r)
+    # r = norm of embeddings
+    image_norms = torch.norm(image_feats, dim=-1)  # (batch_size,)
+    text_norms = torch.norm(text_feats, dim=-1)    # (batch_size,)
+    box_image_norms = torch.norm(box_image_feats, dim=-1)  # (batch_size,)
+    box_text_norms = torch.norm(box_text_feats, dim=-1)    # (batch_size,)
+
+    
+    # Repulsion term: e^(-r) encourages large norms (dispersal in hyperbolic space)
+    # When r is small, e^(-r) is large (high penalty)
+    # When r is large, e^(-r) is small (low penalty)
+    repulsion_loss = (torch.exp(-box_image_norms) + torch.exp(-box_text_norms) + torch.exp(-image_norms) + torch.exp(-text_norms)).mean()
+    
+    # Combine losses
+    total_loss = base_loss["loss"] + repulsion_weight * repulsion_loss
+    
+    # Update logging with repulsion loss
+    logging = base_loss["logging"].copy()
+    logging["repulsion_loss"] = repulsion_loss
+    
+    return {
+        "loss": total_loss,
+        "logging": logging,
+    }
+
+
+@torch.autocast(device_type=_device_type, dtype=_cast_dtype, enabled=_enable_autocast)
 def hycoclip_deep_loss(image_feats, text_feats, box_image_feats, box_text_feats, hierarchy_feats_list, hier_sample_type, all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight=1.0):
     """
     Computes the HyCoCLIP loss with extra hierarchical samples from Deep-GRIT.
