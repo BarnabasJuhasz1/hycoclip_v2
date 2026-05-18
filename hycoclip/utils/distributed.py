@@ -28,6 +28,7 @@ def launch(
     num_gpus_per_machine: int = 1,
     machine_rank: int = 0,
     dist_url: str = "tcp://127.0.0.1:23457",
+    backend: str = "NCCL",
     args=(),
 ):
     """
@@ -48,6 +49,9 @@ def launch(
         We assume all machines have same number of GPUs per machine, with IDs as
         `(0, 1, 2 ...)`. If you do not wish to use all GPUs on a machine,
         set `CUDA_VISIBLE_DEVICES` environment variable appropriately.
+    
+    Args:
+        backend: Distributed backend to use ("NCCL" for GPU, "gloo" for CPU/GPU fallback)
 
     Args:
         job_fn: Function to launch -- this could be your model training function.
@@ -73,13 +77,13 @@ def launch(
             _job_worker,
             nprocs=num_gpus_per_machine,
             args=(
-                job_fn, world_size, num_gpus_per_machine, machine_rank, dist_url, args
+                job_fn, world_size, num_gpus_per_machine, machine_rank, dist_url, backend, args
             ),
             daemon=False,
         )
     else:
         # Default to single machine, single GPU, with ID 0.
-        _job_worker(0, job_fn, 1, 1, 0, dist_url, args)
+        _job_worker(0, job_fn, 1, 1, 0, dist_url, backend, args)
     # fmt: on
 
 
@@ -90,6 +94,7 @@ def _job_worker(
     num_gpus_per_machine: int,
     machine_rank: int,
     dist_url: str,
+    backend: str,
     args: tuple,
 ):
     """
@@ -101,7 +106,7 @@ def _job_worker(
     global_rank = machine_rank * num_gpus_per_machine + local_rank
     try:
         dist.init_process_group(
-            backend="NCCL",
+            backend=backend,
             init_method=dist_url,
             world_size=world_size,
             rank=global_rank,

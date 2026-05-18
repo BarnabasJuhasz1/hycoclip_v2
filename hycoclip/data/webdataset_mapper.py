@@ -119,11 +119,30 @@ class ImageTextWebDataset(IterableDataset):
         self.tarfiles = sorted(self.tarfiles)
         logger.info(f"{self.__class__.__name__} found {len(self.tarfiles)} TARs.")
 
-        # Shard the TAR file paths as per number of GPU processes to avoid loading
-        # duplicates.
+        # Shard the TAR file paths by cumulative file SIZE (not count) to balance load.
+        # This prevents one rank from getting larger files and falling behind during ALLGATHER.
         _rank, _world_size = dist.get_rank(), dist.get_world_size()
-        self.tarfiles = self.tarfiles[_rank::_world_size]
-        logger.info(f"RANK {_rank} will load {len(self.tarfiles)} TARs.")
+        
+        if _world_size > 1:
+            import os
+            # Get file sizes and distribute by cumulative size for balance
+            file_sizes = [(f, os.path.getsize(f)) for f in self.tarfiles]
+            total_size = sum(size for _, size in file_sizes)
+            
+            # Distribute files to each rank trying to match target size
+            rank_files = [[] for _ in range(_world_size)]
+            rank_sizes = [0] * _world_size
+            
+            for tar_file, size in file_sizes:
+                # Assign to rank with smallest current cumulative size
+                min_rank = min(range(_world_size), key=lambda r: rank_sizes[r])
+                rank_files[min_rank].append(tar_file)
+                rank_sizes[min_rank] += size
+            
+            self.tarfiles = rank_files[_rank]
+            logger.info(f"RANK {_rank} will load {len(self.tarfiles)} TARs ({rank_sizes[_rank] / 1e9:.2f} GB).")
+        else:
+            logger.info(f"RANK {_rank} will load {len(self.tarfiles)} TARs.")
 
     def __iter__(self):
         rng = random.Random(self.seed)

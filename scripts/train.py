@@ -267,6 +267,10 @@ if __name__ == "__main__":
     if _A.num_gpus == 0:
         main(_A)
     else:
+        # Load config to extract backend parameter
+        _C = LazyConfig.load(_A.config)
+        backend = getattr(_C.train.ddp, "backend", "NCCL")
+        
         # This will launch `main` and set appropriate CUDA device (GPU ID) as
         # per process (accessed in the beginning of `main`).
         # cmd = 'scontrol show hostnames ' + os.getenv('SLURM_JOB_NODELIST')
@@ -287,5 +291,6 @@ if __name__ == "__main__":
             num_gpus_per_machine=_A.num_gpus,
             machine_rank=_A.machine_rank,
             dist_url=dist_url,
+            backend=backend,
             args=(_A,),
         )

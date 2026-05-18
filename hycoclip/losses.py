@@ -196,6 +196,48 @@ def hycoclip_loss_repulsion(image_feats, text_feats, box_image_feats, box_text_f
 
 
 @torch.autocast(device_type=_device_type, dtype=_cast_dtype, enabled=_enable_autocast)
+def hycoclip_loss_repulsion_poly(image_feats, text_feats, box_image_feats, box_text_feats, all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight=1.0, repulsion_weight=0.1, repulsion_r0=0.5):
+    """
+    Computes the HyCoCLIP loss with polynomial repulsion term.
+    Repulsion loss: repulsion_weight * max(0, r0 - r)^2 
+    where r is the norm of box embeddings and r0 is the target minimum norm (default 0.5).
+    
+    When r < r0: penalty increases as r decreases (encourages spreading)
+    When r >= r0: no penalty (embeddings are already far enough)
+    """
+    # Get standard HyCoCLIP loss
+    base_loss = hycoclip_loss(image_feats, text_feats, box_image_feats, box_text_feats, 
+                               all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight)
+    
+    # Compute polynomial repulsion loss: max(0, r0 - r)^2
+    # r = norm of embeddings
+    image_norms = torch.norm(image_feats, dim=-1)  # (batch_size,)
+    text_norms = torch.norm(text_feats, dim=-1)    # (batch_size,)
+    box_image_norms = torch.norm(box_image_feats, dim=-1)  # (batch_size,)
+    box_text_norms = torch.norm(box_text_feats, dim=-1)    # (batch_size,)
+    
+    # Polynomial repulsion: max(0, r0 - r)^2
+    # Only penalize when r < r0 (embeddings are too close together)
+    repulsion_image = torch.clamp(repulsion_r0 - image_norms, min=0.0) ** 2
+    repulsion_text = torch.clamp(repulsion_r0 - text_norms, min=0.0) ** 2
+    repulsion_image_box = torch.clamp(repulsion_r0 - box_image_norms, min=0.0) ** 2
+    repulsion_text_box = torch.clamp(repulsion_r0 - box_text_norms, min=0.0) ** 2
+    repulsion_loss = (repulsion_image + repulsion_text + repulsion_image_box + repulsion_text_box).mean()
+    
+    # Combine losses
+    total_loss = base_loss["loss"] + repulsion_weight * repulsion_loss
+    
+    # Update logging with repulsion loss
+    logging = base_loss["logging"].copy()
+    logging["repulsion_loss"] = repulsion_loss
+    
+    return {
+        "loss": total_loss,
+        "logging": logging,
+    }
+
+
+@torch.autocast(device_type=_device_type, dtype=_cast_dtype, enabled=_enable_autocast)
 def hycoclip_deep_loss(image_feats, text_feats, box_image_feats, box_text_feats, hierarchy_feats_list, hier_sample_type, all_image_feats, all_text_feats, _curv, _rank, _scale, entail_weight=1.0):
     """
     Computes the HyCoCLIP loss with extra hierarchical samples from Deep-GRIT.

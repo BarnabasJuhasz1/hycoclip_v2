@@ -649,6 +649,160 @@ class HyCoCLIP_Repulsion(HyCoCLIP):
             return losses.hycoclip_deep_loss
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
+    
+    def forward(
+        self, images: torch.Tensor, box_images: torch.Tensor,
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Forward pass for HyCoCLIP_Repulsion with custom loss function.
+        
+        Args:
+            images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+            box_images: Box image batch in BCHW format.
+            tokens: List of tensors, each containing text tokens.
+            box_tokens: List of tensors, each containing box text tokens.
+        """
+        from hycoclip import losses
+        
+        # Setup curvature and scaling factors (same as parent)
+        self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
+        _curv = self.curv.exp()
+        
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+        
+        # Encode features
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+        box_image_feats = self.encode_image(box_images, project=True)
+        box_text_feats = self.encode_text(box_tokens, project=True)
+        
+        # Gather features from all GPUs
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+        
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        
+        # Compute loss using the custom loss function
+        with torch.autocast(self.device.type, dtype=torch.float32):
+            # Clamp temperature
+            self.logit_scale.data = torch.clamp(self.logit_scale.data, max=4.6052)
+            _scale = self.logit_scale.exp()
+            
+            # Call the loss function directly (not via get_loss_fn to avoid double-binding)
+            if self.loss_fn_name == "hycoclip_loss_repulsion":
+                loss_output = losses.hycoclip_loss_repulsion(
+                    image_feats, text_feats, 
+                    box_image_feats, box_text_feats,
+                    all_image_feats, all_text_feats,
+                    _curv, self._rank, _scale,
+                    entail_weight=self.entail_weight,
+                    repulsion_weight=self.repulsion_weight
+                )
+            else:
+                # For other loss functions, use get_loss_fn
+                loss_fn = self.get_loss_fn(self.loss_fn_name)
+                loss_output = loss_fn(
+                    image_feats, text_feats, 
+                    box_image_feats, box_text_feats,
+                    all_image_feats, all_text_feats,
+                    _curv, self._rank, _scale,
+                    entail_weight=self.entail_weight
+                )
+        
+        return loss_output
+
+
+class HyCoCLIP_Repulsion_Poly(HyCoCLIP_Repulsion):
+    """
+    HyCoCLIP variant with polynomial repulsion loss.
+    Uses max(0, r0 - r)^2 instead of exponential repulsion.
+    Better control over target separation distance via r0 parameter.
+    """
+
+    def __init__(
+        self,
+        visual: nn.Module,
+        textual: TransformerTextEncoder,
+        embed_dim: int,
+        curv_init: float = 1.0,
+        learn_curv: bool = True,
+        entail_weight: float = 0.0,
+        repulsion_weight: float = 0.1,
+        repulsion_r0: float = 0.5,
+        use_boxes: bool = True,
+        use_hierarchies: bool = False,
+        loss_fn: str = "hycoclip_loss_repulsion_poly",
+        pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
+        pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
+    ):
+        """
+        Args:
+            repulsion_r0: Target minimum norm for box embeddings. Only penalizes when norm < r0.
+                Default 0.5 is reasonable for hyperbolic embeddings. Can adjust based on desired separation.
+            Other args same as HyCoCLIP_Repulsion.
+        """
+        super().__init__(
+            visual, textual, embed_dim, curv_init, learn_curv, 
+            entail_weight, repulsion_weight, use_boxes, use_hierarchies, loss_fn, pixel_mean, pixel_std
+        )
+        self.repulsion_r0 = repulsion_r0
+    
+    def forward(
+        self, images: torch.Tensor, box_images: torch.Tensor,
+        tokens: list[torch.Tensor], box_tokens: list[torch.Tensor]
+    ) -> dict[str, torch.Tensor]:
+        """
+        Forward pass for HyCoCLIP_Repulsion_Poly with polynomial repulsion loss.
+        
+        Args:
+            images: Image batch in BCHW format, with pixel values in `[0, 1]`.
+            box_images: Box image batch in BCHW format.
+            tokens: List of tensors, each containing text tokens.
+            box_tokens: List of tensors, each containing box text tokens.
+        """
+        from hycoclip import losses
+        
+        # Setup curvature and scaling factors (same as parent)
+        self.curv.data = torch.clamp(self.curv.data, **self._curv_minmax)
+        _curv = self.curv.exp()
+        
+        self.visual_alpha.data = torch.clamp(self.visual_alpha.data, max=0.0)
+        self.textual_alpha.data = torch.clamp(self.textual_alpha.data, max=0.0)
+        
+        # Encode features
+        image_feats = self.encode_image(images, project=True)
+        text_feats = self.encode_text(tokens, project=True)
+        box_image_feats = self.encode_image(box_images, project=True)
+        box_text_feats = self.encode_text(box_tokens, project=True)
+        
+        # Gather features from all GPUs
+        all_image_feats = dist.gather_across_processes(image_feats)
+        all_text_feats = dist.gather_across_processes(text_feats)
+        
+        all_image_feats = torch.cat(all_image_feats, dim=0)
+        all_text_feats = torch.cat(all_text_feats, dim=0)
+        
+        # Compute loss using the polynomial repulsion loss function
+        with torch.autocast(self.device.type, dtype=torch.float32):
+            # Clamp temperature
+            self.logit_scale.data = torch.clamp(self.logit_scale.data, max=4.6052)
+            _scale = self.logit_scale.exp()
+            
+            # Call the polynomial repulsion loss function
+            loss_output = losses.hycoclip_loss_repulsion_poly(
+                image_feats, text_feats, 
+                box_image_feats, box_text_feats,
+                all_image_feats, all_text_feats,
+                _curv, self._rank, _scale,
+                entail_weight=self.entail_weight,
+                repulsion_weight=self.repulsion_weight,
+                repulsion_r0=self.repulsion_r0
+            )
+        
+        return loss_output
 
 
 class HyCoCLIP_Re_Weight(MERU):

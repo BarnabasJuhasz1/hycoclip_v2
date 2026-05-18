@@ -245,7 +245,10 @@ class LazyFactory:
 
         # Wrap model in DDP if using more than one GPUs.
         if dist.get_world_size() > 1:
-            model = DistributedDataParallel(model, [device], **cfg.train.ddp)
+            # Extract backend from config (used in init_process_group, not DDP)
+            ddp_cfg = dict(cfg.train.ddp)
+            ddp_cfg.pop('backend', None)
+            model = DistributedDataParallel(model, [device], **ddp_cfg)
 
             # Optionally add FP16 compression hook with AMP.
             if cfg.train.amp and cfg.train.ddp_fp16_compression:
