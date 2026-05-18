@@ -77,7 +77,8 @@ train = dict(
     num_iterations=90000,
     cudnn_benchmark=True,
     cudnn_deterministic=False,
-    num_workers=4,
+    num_workers=8,
+    gradient_accumulation_steps=2,  # Accumulate 2 steps before ALLGATHER (halves communication frequency)
     ddp=dict(  # options for DistributedDataParallel
         broadcast_buffers=False, static_graph=True
     ),

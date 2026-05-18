@@ -225,13 +225,19 @@ def main(_A: argparse.Namespace):
 
             loss = output_dict["loss"]
 
-        # Gradient accumulation: scale loss and backward
-        accumulation_steps = getattr(_C.train, "gradient_accumulation_steps", 1)
-        loss_scaled = loss / accumulation_steps
-        scaler.scale(loss_scaled).backward()
+        # Gradient accumulation: scale loss and defer communication
+        accum_steps = getattr(_C.train, "gradient_accumulation_steps", 1)
+        is_accumulation_step = (iteration % accum_steps) != 0
+        
+        # For DDP: skip synchronization on intermediate accumulation steps
+        if is_accumulation_step and hasattr(model, "no_sync"):
+            with model.no_sync():
+                scaler.scale(loss / accum_steps).backward()
+        else:
+            scaler.scale(loss / accum_steps).backward()
 
         # Optimizer step only after accumulating gradients
-        if (iteration % accumulation_steps == 0) or (iteration == _C.train.num_iterations):
+        if not is_accumulation_step or iteration == _C.train.num_iterations:
             scaler.step(optimizer)
             scaler.update()
             scheduler.step()
