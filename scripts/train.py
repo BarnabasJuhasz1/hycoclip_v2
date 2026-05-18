@@ -225,10 +225,17 @@ def main(_A: argparse.Namespace):
 
             loss = output_dict["loss"]
 
-        scaler.scale(loss).backward()
-        scaler.step(optimizer)
-        scaler.update()
-        scheduler.step()
+        # Gradient accumulation: scale loss and backward
+        accumulation_steps = getattr(_C.train, "gradient_accumulation_steps", 1)
+        loss_scaled = loss / accumulation_steps
+        scaler.scale(loss_scaled).backward()
+
+        # Optimizer step only after accumulating gradients
+        if (iteration % accumulation_steps == 0) or (iteration == _C.train.num_iterations):
+            scaler.step(optimizer)
+            scaler.update()
+            scheduler.step()
+        
         timer.toc()
 
         # Log statistics to terminal and tensorboard.
@@ -267,10 +274,6 @@ if __name__ == "__main__":
     if _A.num_gpus == 0:
         main(_A)
     else:
-        # Load config to extract backend parameter
-        _C = LazyConfig.load(_A.config)
-        backend = getattr(_C.train.ddp, "backend", "NCCL")
-        
         # This will launch `main` and set appropriate CUDA device (GPU ID) as
         # per process (accessed in the beginning of `main`).
         # cmd = 'scontrol show hostnames ' + os.getenv('SLURM_JOB_NODELIST')
@@ -291,6 +294,5 @@ if __name__ == "__main__":
             num_gpus_per_machine=_A.num_gpus,
             machine_rank=_A.machine_rank,
             dist_url=dist_url,
-            backend=backend,
             args=(_A,),
         )
