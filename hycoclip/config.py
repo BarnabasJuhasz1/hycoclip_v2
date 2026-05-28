@@ -245,7 +245,14 @@ class LazyFactory:
 
         # Wrap model in DDP if using more than one GPUs.
         if dist.get_world_size() > 1:
-            model = DistributedDataParallel(model, [device], **cfg.train.ddp)
+            # Convert device to GPU index if it's a torch.device object
+            device_id = device.index if isinstance(device, torch.device) else device
+            model = DistributedDataParallel(
+                model, 
+                device_ids=[device_id], 
+                output_device=device_id,
+                **cfg.train.ddp
+            )
 
             # Optionally add FP16 compression hook with AMP.
             if cfg.train.amp and cfg.train.ddp_fp16_compression:

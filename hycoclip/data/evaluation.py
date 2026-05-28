@@ -14,7 +14,6 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Callable, Iterator, Tuple
 
-import tensorflow_datasets as tfds
 import torch
 from PIL import Image
 from torch.utils.data import Dataset, IterDataPipe
@@ -259,6 +258,9 @@ class TfdsWrapper(IterDataPipe):
         self.split = split
         self.transform = transform
 
+        # Lazy import to avoid TensorFlow CUDA context contamination during DDP spawning
+        import tensorflow_datasets as tfds
+        
         dset = tfds.load(name, split=split, data_dir=root)
         dset = tfds.as_numpy(dset)
 

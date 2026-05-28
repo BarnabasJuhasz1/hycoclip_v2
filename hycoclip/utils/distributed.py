@@ -99,20 +99,23 @@ def _job_worker(
 
     # Adjust global rank of process based on its machine rank.
     global_rank = machine_rank * num_gpus_per_machine + local_rank
+    
+    # Set GPU ID BEFORE NCCL initialization - critical for NCCL to know rank<->GPU mapping
+    torch.cuda.set_device(local_rank)
+    
     try:
         dist.init_process_group(
             backend="NCCL",
             init_method=dist_url,
             world_size=world_size,
             rank=global_rank,
+            device_id=torch.device("cuda", local_rank),
         )
     except Exception as e:
         logger.error(f"Error launching processes, dist URL: {dist_url}")
         raise e
 
     synchronize()
-    # Set GPU ID for each process according to its rank.
-    torch.cuda.set_device(local_rank)
     job_fn(*args)
 
 

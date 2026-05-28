@@ -42,7 +42,9 @@ from hycoclip.new_models.re_weight_withoutD import HyCoCLIP_Re_Weight_withoutD
 import os
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
-
+# Disable NCCL watchdog monitoring (can cause false positives on slow operations)
+os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0'
+os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '1800'
 
 # fmt: off
 parser = argparse.ArgumentParser(description=__doc__)
