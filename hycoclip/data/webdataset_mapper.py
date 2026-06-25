@@ -1,8 +1,8 @@
 from __future__ import annotations
 
-import copy
 import glob
 import random
+import tarfile as tarfile_module
 import numpy as np
 from typing import Callable
 
@@ -23,9 +23,49 @@ import torch
 ws.load()
 
 
+def _grouped_tar_to_samples(src, handler=wds.warn_and_continue):
+    """Read tar files and yield samples grouped by key.
+
+    Unlike wds.tarfile_to_samples which requires consecutive entries per key,
+    this accumulates ALL entries with the same key from the entire tar before
+    yielding — needed when files are stored interleaved rather than grouped.
+    """
+    for shard in src:
+        url = shard["url"] if isinstance(shard, dict) and "url" in shard else shard
+
+        samples = {}
+        try:
+            with tarfile_module.open(url) as tf:
+                for member in tf.getmembers():
+                    if not member.isfile():
+                        continue
+                    name = member.name
+                    dot_idx = name.find('.')
+                    if dot_idx == -1:
+                        continue
+                    key = name[:dot_idx]
+                    ext = name[dot_idx + 1:]
+                    f = tf.extractfile(member)
+                    if f is not None:
+                        if key not in samples:
+                            samples[key] = {'__key__': key, '__url__': url}
+                        samples[key][ext] = f.read()
+        except Exception as e:
+            try:
+                handler(e)
+            except StopIteration:
+                return
+            continue
+
+        yield from samples.values()
+
+
+grouped_tar_to_samples = wds.pipelinefilter(_grouped_tar_to_samples)
+
+
 def check_parent_keys(sample):
     """
-    Check if all parent keys are present in the sample.
+    Check if all parent keys are present in the sample (post-decode, values are strings/PIL).
     """
     if "numparents.txt" not in sample:
         return False
@@ -34,8 +74,23 @@ def check_parent_keys(sample):
         if f"parent{box:03d}.txt" not in sample or f"parent{box:03d}.jpg" not in sample:
             return False
     return True
-    # parents_diff_child = sum((len(sample[f"parent{box:03d}.txt"]) > len(sample["child.txt"])-2) for box in range(num_of_parents))
-    # return parents_diff_child == num_of_parents
+
+
+def check_parent_keys_raw(sample):
+    """
+    Check if all parent keys are present before decoding (values are raw bytes).
+    Avoids wasting CPU on BICUBIC decoding for samples that will be filtered.
+    """
+    if "numparents.txt" not in sample:
+        return False
+    try:
+        num_of_parents = int(sample["numparents.txt"].decode().strip())
+    except (ValueError, UnicodeDecodeError, AttributeError):
+        return False
+    for box in range(num_of_parents):
+        if f"parent{box:03d}.txt" not in sample or f"parent{box:03d}.jpg" not in sample:
+            return False
+    return True
     
 
 class JsonAnnotationLoader:
@@ -80,6 +135,7 @@ class ImageTextWebDataset(IterableDataset):
         tarfiles: str | list[str],
         mapper: Callable,
         buffer_size: int = 5000,
+        initial_buffer_size: int | None = None,
         infinite_stream: bool = True,
         seed: int = 0
     ):
@@ -88,9 +144,13 @@ class ImageTextWebDataset(IterableDataset):
             tarfiles: Path(s) or glob-patterns for TAR files in WebDataset format.
             mapper: A callable to transform a single dataset dict (image and
                 annotations). May implement data augmentation and tokenization.
-            buffer_size: Size of the internal buffer of instances. Data is read
+            buffer_size: Size of the internal shuffle buffer. Data is read
                 sequentially from TAR files into this buffer and served randomly.
                 Shuffling will be disabled if this is set to zero.
+            initial_buffer_size: How many samples must be loaded into the shuffle
+                buffer before the pipeline starts yielding. Defaults to buffer_size
+                (fill entirely before starting). Set lower (e.g. 500) to reduce
+                startup latency at a minor cost to shuffle quality at the very start.
             infinite_stream: Yield an infinite stream of instances if this is
                 True. In such cases, the user must terminate this iterator manually
                 (e.g. run a fixed sized for-loop in training code).
@@ -102,6 +162,7 @@ class ImageTextWebDataset(IterableDataset):
         super().__init__()
         self.mapper = mapper
         self.buffer_size = buffer_size
+        self.initial_buffer_size = initial_buffer_size if initial_buffer_size is not None else buffer_size
         self.infinite_stream = infinite_stream
         self.seed = seed
 
@@ -138,24 +199,26 @@ class ImageTextWebDataset(IterableDataset):
         pipeline = wds.DataPipeline(
             wds.SimpleShardList(self.tarfiles, seed=self.seed),
             wds.split_by_worker,
-            wds.tarfile_to_samples(),
+            grouped_tar_to_samples(),
         )
 
         if self.buffer_size > 1:
             pipeline.append(
-                wds.shuffle(self.buffer_size, initial=self.buffer_size, rng=rng),
+                wds.shuffle(self.buffer_size, initial=self.initial_buffer_size, rng=rng),
             )
 
+        # Filter on raw bytes before decoding so invalid samples never get decoded.
+        pipeline.append(wds.select(check_parent_keys_raw))
         # Decode images using PIL and apply custom mapper.
         pipeline.append(wds.decode("pil", handler=wds.warn_and_continue))
-        pipeline.append(wds.select(check_parent_keys))  # Ensure all parent keys are present.
         pipeline.append(wds.map(self.mapper))
 
         if self.infinite_stream:
             # Sample an infinite stream of dataset dicts.
+            # Each call to `yield from pipeline` invokes pipeline.__iter__() fresh,
+            # restarting from the beginning — no deepcopy needed.
             while True:
-                pipeline_copy = copy.deepcopy(pipeline)
-                yield from pipeline_copy
+                yield from pipeline
         else:
             # Run for one epoch and stop:
             yield from pipeline

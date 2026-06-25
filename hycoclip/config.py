@@ -226,14 +226,18 @@ class LazyFactory:
     @staticmethod
     def build_dataloader(cfg: DictConfig):
         # Instantiate dataset and wrap in dataloader.
+        num_workers = cfg.train.num_workers
         return DataLoader(
             instantiate(cfg.dataset),
-            num_workers=cfg.train.num_workers,
+            num_workers=num_workers,
             batch_size=cfg.train.total_batch_size // dist.get_world_size(),
             drop_last=True,
             pin_memory=True,
-            # Added for HyCoCLIP_V2
-            collate_fn=LazyFactory.safe_collate
+            collate_fn=LazyFactory.safe_collate,
+            # Use 'spawn' instead of 'fork' so workers start without inheriting
+            # the parent's CUDA/NCCL state, which would cause hangs in DDP.
+            multiprocessing_context='spawn' if num_workers > 0 else None,
+            persistent_workers=num_workers > 0,
         )
 
     @staticmethod

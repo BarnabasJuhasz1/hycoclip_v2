@@ -25,6 +25,7 @@ dataset = L(ImageTextWebDataset)(
         ],
     ),
     buffer_size=4000,
+    initial_buffer_size=500,
     seed="${..train.seed}",
 )
 
@@ -34,6 +35,7 @@ model = L(HyCoCLIP_Repulsion)(
         arch="vit_base_patch16_224",
         global_pool="token",
         use_sincos2d_pos=True,
+        grad_checkpointing=True,
     ),
     textual=L(TransformerTextEncoder)(
         arch="L12_W512", vocab_size=49408, context_length=77
@@ -77,10 +79,9 @@ train = dict(
     num_iterations=90000,
     cudnn_benchmark=True,
     cudnn_deterministic=False,
-    num_workers=8,
-    gradient_accumulation_steps=2,  # Accumulate 2 steps before ALLGATHER (halves communication frequency)
+    num_workers=4,
     ddp=dict(  # options for DistributedDataParallel
-        broadcast_buffers=False, static_graph=True
+        broadcast_buffers=False,
     ),
     ddp_fp16_compression=True,
 )

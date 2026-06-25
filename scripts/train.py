@@ -166,7 +166,9 @@ def main(_A: argparse.Namespace):
     start_iteration = checkpoint_manager.resume(model_only=False) if _A.resume else 0
 
     # Create an iterator from dataloader to sample batches perpetually.
+    logger.info(f"RANK {RANK}: creating dataloader iterator...")
     dataloader_iter = iter(dataloader)
+    logger.info(f"RANK {RANK}: dataloader iterator created, waiting for first batch...")
     timer = Timer(start_iteration + 1, total_iterations=_C.train.num_iterations)
 
     # Create tensorboard writer, only in main process.
@@ -180,6 +182,8 @@ def main(_A: argparse.Namespace):
         data_time = time.perf_counter()
         batch = next(dataloader_iter)
         data_time = time.perf_counter() - data_time
+        if iteration == 1:
+            logger.info(f"RANK {RANK}: got first batch! image shape={batch['image'].shape}")
 
         timer.tic()
         optimizer.zero_grad()
@@ -208,22 +212,22 @@ def main(_A: argparse.Namespace):
                 # box_tokens shape: 192 x tensor
                 # text_hierarchy_tokens shape: 192 x 4 x tensor
 
-                output_dict = model(batch["image"].to(device),
-                                    batch["box_image"].to(device),
+                output_dict = model(batch["image"].to(device, non_blocking=True),
+                                    batch["box_image"].to(device, non_blocking=True),
                                     tokens,
                                     box_tokens,
                                     text_hierarchy_tokens,
-                                    batch["scores"].to(device))
+                                    batch["scores"].to(device, non_blocking=True))
             else:
 
                 if use_boxes:
                     box_tokens = tokenizer(batch["box_text"])
-                    output_dict = model(batch["image"].to(device),
-                                        batch["box_image"].to(device),
+                    output_dict = model(batch["image"].to(device, non_blocking=True),
+                                        batch["box_image"].to(device, non_blocking=True),
                                         tokens,
                                         box_tokens)
                 else:
-                    output_dict = model(batch["image"].to(device), tokens)
+                    output_dict = model(batch["image"].to(device, non_blocking=True), tokens)
 
             loss = output_dict["loss"]
 
