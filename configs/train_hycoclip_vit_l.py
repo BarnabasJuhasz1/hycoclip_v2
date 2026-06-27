@@ -22,7 +22,7 @@ from torch.optim import AdamW
 from torchvision import transforms as T
 
 from hycoclip.config import LazyCall as L
-from hycoclip.data.webdataset_mapper import ExtendedGroundedDatasetTarMapper, ImageTextWebDataset
+from hycoclip.data.webdataset_mapper import GroundedDatasetTarMapper, ImageTextWebDataset
 from hycoclip.encoders.image_encoders import build_timm_vit
 from hycoclip.encoders.text_encoders import TransformerTextEncoder
 from hycoclip.models2 import HyCoCLIP
@@ -31,15 +31,13 @@ from hycoclip.optim import LinearWarmupCosineDecayLR, set_weight_decay_per_param
 
 dataset = L(ImageTextWebDataset)(
     tarfiles=["datasets/train/GRIT/tar_fitted/*.tar"],
-    mapper=L(ExtendedGroundedDatasetTarMapper)(
+    mapper=L(GroundedDatasetTarMapper)(
         image_transform=[
             L(T.RandomResizedCrop)(
                 size=224, scale=(0.5, 1.0), interpolation=T.InterpolationMode.BICUBIC
             ),
             L(T.ToTensor)(),
         ],
-        # use_extra_hierarchy_samples=False, # NOT using Deep-GRIT hierarchies by default
-        use_proposed_hierachies=False, # NOT using proposed hierarchies by default
     ),
     buffer_size=4000,
     seed="${..train.seed}",

@@ -1,0 +1,16 @@
+INSIDE CLIP INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False and hier_sample_type is set to HierarchySampleType.ALL
+INSIDE MERU INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False
+Initialized HyCoCLIP with loss function: hycoclip_loss
+Use boxes: True, Use hierarchies: False
+INSIDE CLIP INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False and hier_sample_type is set to HierarchySampleType.ALL
+INSIDE MERU INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False
+Initialized HyCoCLIP with loss function: hycoclip_loss
+Use boxes: True, Use hierarchies: False
+INSIDE CLIP INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False and hier_sample_type is set to HierarchySampleType.ALL
+INSIDE MERU INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False
+Initialized HyCoCLIP with loss function: hycoclip_loss
+Use boxes: True, Use hierarchies: False
+INSIDE CLIP INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False and hier_sample_type is set to HierarchySampleType.ALL
+INSIDE MERU INIT, USE BOXES AND HIERARCHIES IS SET TO: False and False
+Initialized HyCoCLIP with loss function: hycoclip_loss
+Use boxes: True, Use hierarchies: False
