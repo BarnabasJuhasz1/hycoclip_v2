@@ -91,7 +91,16 @@ def check_parent_keys_raw(sample):
         if f"parent{box:03d}.txt" not in sample or f"parent{box:03d}.jpg" not in sample:
             return False
     return True
-    
+
+
+def check_child_keys_raw(sample):
+    """
+    Check if the child image/caption keys are present, ignoring any parent
+    (box) keys. Used to read GRIT-format tars without requiring boxes.
+    """
+    return "child.jpg" in sample and "child.txt" in sample
+
+
 
 class JsonAnnotationLoader:
     def __init__(self, folder, annotation_key, max_cache_size=10):
@@ -137,7 +146,8 @@ class ImageTextWebDataset(IterableDataset):
         buffer_size: int = 5000,
         initial_buffer_size: int | None = None,
         infinite_stream: bool = True,
-        seed: int = 0
+        seed: int = 0,
+        sample_filter: Callable = check_parent_keys_raw,
     ):
         """
         Args:
@@ -158,6 +168,11 @@ class ImageTextWebDataset(IterableDataset):
                 will load batches deterministically across different runs (only if
                 batch size and number of GPUs/CPUs are same). This seed can either
                 be same or different per GPU process for multi-GPU training.
+            sample_filter: Predicate applied to raw (undecoded) samples to decide
+                which ones survive. Defaults to requiring valid parent/box keys;
+                pass `check_child_keys_raw` to only require child.jpg/child.txt
+                (e.g. for using GRIT tars without boxes, alongside a mapper that
+                doesn't read parent fields).
         """
         super().__init__()
         self.mapper = mapper
@@ -165,6 +180,7 @@ class ImageTextWebDataset(IterableDataset):
         self.initial_buffer_size = initial_buffer_size if initial_buffer_size is not None else buffer_size
         self.infinite_stream = infinite_stream
         self.seed = seed
+        self.sample_filter = sample_filter
 
         # Convert a single path (glob) to a list.
         if isinstance(tarfiles, str):
@@ -208,7 +224,7 @@ class ImageTextWebDataset(IterableDataset):
             )
 
         # Filter on raw bytes before decoding so invalid samples never get decoded.
-        pipeline.append(wds.select(check_parent_keys_raw))
+        pipeline.append(wds.select(self.sample_filter))
         # Decode images using PIL and apply custom mapper.
         pipeline.append(wds.decode("pil", handler=wds.warn_and_continue))
         pipeline.append(wds.map(self.mapper))
@@ -224,6 +240,168 @@ class ImageTextWebDataset(IterableDataset):
             yield from pipeline
 
 
+class ChildOnlyTarMapper:
+    """
+    Mapper that reads only the child image/caption from GRIT-format TAR files,
+    ignoring any parent (box) keys. Pairs with `ImageTextWebDataset(sample_filter=
+    check_child_keys_raw)` to use GRIT data for box-agnostic training (e.g. plain
+    CLIP/MERU), producing the same {"image", "text"} shape as `ImageTextTarMapper`
+    so it can be mixed with flat (non-GRIT) datasets in the same batch.
+    """
+
+    def __init__(
+        self,
+        image_transform: list[Callable] = [
+            T.Resize(224),
+            T.CenterCrop(224),
+            T.ToTensor(),
+        ],
+    ):
+        self.image_transform = T.Compose(image_transform)
+
+    def __call__(self, dataset_dict: dict):
+        return {
+            "__key__": dataset_dict["__key__"],
+            "image": self.image_transform(dataset_dict["child.jpg"]),
+            "text": dataset_dict["child.txt"],
+        }
+
+
+class FlatImageTextWebDataset(IterableDataset):
+    """
+    Iterable dataset for flat (image, caption) TAR shards with no grounding
+    boxes, e.g. img2dataset output (`<key>.jpg` / `<key>.txt` / `<key>.json`
+    per sample, stored consecutively). Unlike `ImageTextWebDataset`, this uses
+    webdataset's standard `tarfile_to_samples` reader instead of the grouped
+    reader, since there is no parent/child structure here.
+    """
+
+    def __init__(
+        self,
+        tarfiles: str | list[str],
+        mapper: Callable,
+        buffer_size: int = 5000,
+        initial_buffer_size: int | None = None,
+        infinite_stream: bool = True,
+        seed: int = 0
+    ):
+        """
+        Args: same as `ImageTextWebDataset`.
+        """
+        super().__init__()
+        self.mapper = mapper
+        self.buffer_size = buffer_size
+        self.initial_buffer_size = initial_buffer_size if initial_buffer_size is not None else buffer_size
+        self.infinite_stream = infinite_stream
+        self.seed = seed
+
+        if isinstance(tarfiles, str):
+            tarfiles = [tarfiles]
+
+        self.tarfiles = []
+        for _path in tarfiles:
+            for _single_glob in _path.split():
+                self.tarfiles.extend(glob.glob(_single_glob))
+
+        self.tarfiles = sorted(self.tarfiles)
+        logger.info(f"{self.__class__.__name__} found {len(self.tarfiles)} TARs.")
+
+        _rank, _world_size = dist.get_rank(), dist.get_world_size()
+
+        if _world_size > 1:
+            files_per_rank = (len(self.tarfiles) + _world_size - 1) // _world_size
+            start_idx = _rank * files_per_rank
+            end_idx = min(start_idx + files_per_rank, len(self.tarfiles))
+            self.tarfiles = self.tarfiles[start_idx:end_idx]
+            logger.info(f"RANK {_rank} will load {len(self.tarfiles)} TARs.")
+        else:
+            logger.info(f"RANK {_rank} will load {len(self.tarfiles)} TARs.")
+
+    def __iter__(self):
+        rng = random.Random(self.seed)
+        pipeline = wds.DataPipeline(
+            wds.SimpleShardList(self.tarfiles, seed=self.seed),
+            wds.split_by_worker,
+            wds.tarfile_to_samples(handler=wds.warn_and_continue),
+        )
+
+        if self.buffer_size > 1:
+            pipeline.append(
+                wds.shuffle(self.buffer_size, initial=self.initial_buffer_size, rng=rng),
+            )
+
+        pipeline.append(wds.decode("pil", handler=wds.warn_and_continue))
+        pipeline.append(wds.map(self.mapper))
+
+        if self.infinite_stream:
+            while True:
+                yield from pipeline
+        else:
+            yield from pipeline
+
+
+class ImageTextTarMapper:
+    """
+    Mapper to pre-process image-text instances from flat (no grounding boxes)
+    TAR files, e.g. img2dataset output. Pairs with `FlatImageTextWebDataset`.
+    """
+
+    def __init__(
+        self,
+        image_transform: list[Callable] = [
+            T.Resize(224),
+            T.CenterCrop(224),
+            T.ToTensor(),
+        ],
+    ):
+        self.image_transform = T.Compose(image_transform)
+
+    def __call__(self, dataset_dict: dict):
+        return {
+            "__key__": dataset_dict["__key__"],
+            "image": self.image_transform(dataset_dict["jpg"]),
+            "text": dataset_dict["txt"],
+        }
+
+
+class MixedIterableDataset(IterableDataset):
+    """
+    Combines multiple IterableDatasets, sampling from each independently at
+    every step according to fixed weights (e.g. 90% GRIT, 10% pixmo-cap).
+    All sub-datasets must yield dicts with the same keys.
+    """
+
+    def __init__(self, datasets: list[IterableDataset], weights: list[float], seed: int = 0):
+        """
+        Args:
+            datasets: Sub-datasets to sample from (each should be an
+                infinite-stream IterableDataset, e.g. `ImageTextWebDataset`
+                or `FlatImageTextWebDataset`).
+            weights: Sampling weight per dataset, in the same order. Need not
+                sum to 1 (normalized internally).
+            seed: Random seed for the mixing choice. Combined with each
+                worker's id so DataLoader workers don't all make the same
+                sequence of choices.
+        """
+        super().__init__()
+        assert len(datasets) == len(weights)
+        total = sum(weights)
+        self.datasets = datasets
+        self.weights = [w / total for w in weights]
+        self.seed = seed
+
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        worker_seed = self.seed if worker_info is None else self.seed + worker_info.id
+        rng = random.Random(worker_seed)
+
+        iterators = [iter(d) for d in self.datasets]
+        indices = list(range(len(self.datasets)))
+        while True:
+            idx = rng.choices(indices, weights=self.weights, k=1)[0]
+            yield next(iterators[idx])
+
+
 class GroundedDatasetTarMapper:
     """
     Mapper to pre-process image-text instances from Grounded dataset TAR files.
@@ -236,12 +414,15 @@ class GroundedDatasetTarMapper:
             T.CenterCrop(224),
             T.ToTensor(),
         ],
+        use_proposed_hierachies: bool = False,
     ):
         """
         Args:
             image_transform: List of image transformations from torchvision.
+            use_proposed_hierachies: Accepted for config compatibility.
         """
         self.image_transform = T.Compose(image_transform)
+        self.use_proposed_hierachies = use_proposed_hierachies
 
     def __call__(self, dataset_dict: dict):
         num_boxes = int(dataset_dict["numparents.txt"])

@@ -42,9 +42,7 @@ from hycoclip.new_models.re_weight_withoutD import HyCoCLIP_Re_Weight_withoutD
 import os
 os.environ['HF_DATASETS_OFFLINE'] = '1'
 os.environ['TRANSFORMERS_OFFLINE'] = '1'
-# Disable NCCL watchdog monitoring (can cause false positives on slow operations)
-os.environ['TORCH_NCCL_ENABLE_MONITORING'] = '0'
-os.environ['TORCH_NCCL_HEARTBEAT_TIMEOUT_SEC'] = '1800'
+
 
 # fmt: off
 parser = argparse.ArgumentParser(description=__doc__)
@@ -166,9 +164,7 @@ def main(_A: argparse.Namespace):
     start_iteration = checkpoint_manager.resume(model_only=False) if _A.resume else 0
 
     # Create an iterator from dataloader to sample batches perpetually.
-    logger.info(f"RANK {RANK}: creating dataloader iterator...")
     dataloader_iter = iter(dataloader)
-    logger.info(f"RANK {RANK}: dataloader iterator created, waiting for first batch...")
     timer = Timer(start_iteration + 1, total_iterations=_C.train.num_iterations)
 
     # Create tensorboard writer, only in main process.
@@ -182,8 +178,6 @@ def main(_A: argparse.Namespace):
         data_time = time.perf_counter()
         batch = next(dataloader_iter)
         data_time = time.perf_counter() - data_time
-        if iteration == 1:
-            logger.info(f"RANK {RANK}: got first batch! image shape={batch['image'].shape}")
 
         timer.tic()
         optimizer.zero_grad()
@@ -212,42 +206,29 @@ def main(_A: argparse.Namespace):
                 # box_tokens shape: 192 x tensor
                 # text_hierarchy_tokens shape: 192 x 4 x tensor
 
-                output_dict = model(batch["image"].to(device, non_blocking=True),
-                                    batch["box_image"].to(device, non_blocking=True),
+                output_dict = model(batch["image"].to(device),
+                                    batch["box_image"].to(device),
                                     tokens,
                                     box_tokens,
                                     text_hierarchy_tokens,
-                                    batch["scores"].to(device, non_blocking=True))
+                                    batch["scores"].to(device))
             else:
 
                 if use_boxes:
                     box_tokens = tokenizer(batch["box_text"])
-                    output_dict = model(batch["image"].to(device, non_blocking=True),
-                                        batch["box_image"].to(device, non_blocking=True),
+                    output_dict = model(batch["image"].to(device),
+                                        batch["box_image"].to(device),
                                         tokens,
                                         box_tokens)
                 else:
-                    output_dict = model(batch["image"].to(device, non_blocking=True), tokens)
+                    output_dict = model(batch["image"].to(device), tokens)
 
             loss = output_dict["loss"]
 
-        # Gradient accumulation: scale loss and defer communication
-        accum_steps = getattr(_C.train, "gradient_accumulation_steps", 1)
-        is_accumulation_step = (iteration % accum_steps) != 0
-        
-        # For DDP: skip synchronization on intermediate accumulation steps
-        if is_accumulation_step and hasattr(model, "no_sync"):
-            with model.no_sync():
-                scaler.scale(loss / accum_steps).backward()
-        else:
-            scaler.scale(loss / accum_steps).backward()
-
-        # Optimizer step only after accumulating gradients
-        if not is_accumulation_step or iteration == _C.train.num_iterations:
-            scaler.step(optimizer)
-            scaler.update()
-            scheduler.step()
-        
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
+        scheduler.step()
         timer.toc()
 
         # Log statistics to terminal and tensorboard.

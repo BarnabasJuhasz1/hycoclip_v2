@@ -218,10 +218,10 @@ def hycoclip_loss_repulsion_poly(image_feats, text_feats, box_image_feats, box_t
     
     # Polynomial repulsion: max(0, r0 - r)^2
     # Only penalize when r < r0 (embeddings are too close together)
-    repulsion_image = torch.clamp(repulsion_r0 - image_norms, min=0.0) ** 2
-    repulsion_text = torch.clamp(repulsion_r0 - text_norms, min=0.0) ** 2
-    repulsion_image_box = torch.clamp(repulsion_r0 - box_image_norms, min=0.0) ** 2
-    repulsion_text_box = torch.clamp(repulsion_r0 - box_text_norms, min=0.0) ** 2
+    repulsion_image = torch.clamp(repulsion_r0 - image_norms, min=0.0) **2
+    repulsion_text = torch.clamp(repulsion_r0 - text_norms, min=0.0) **2
+    repulsion_image_box = torch.clamp(repulsion_r0 - box_image_norms, min=0.0) **2
+    repulsion_text_box = torch.clamp(repulsion_r0 - box_text_norms, min=0.0) **2
     repulsion_loss = (repulsion_image + repulsion_text + repulsion_image_box + repulsion_text_box).mean()
     
     # Combine losses

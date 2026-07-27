@@ -226,18 +226,24 @@ class LazyFactory:
     @staticmethod
     def build_dataloader(cfg: DictConfig):
         # Instantiate dataset and wrap in dataloader.
+        dataset = instantiate(cfg.dataset)
+        
+        # For IterableDataset:
+        # - batch_size is the number of samples collected from the pipeline each iteration
+        # - With workers, each worker independently yields samples from its subset of shards
+        # - DataLoader collects batch_size samples total (not per worker) from all workers
+        batch_size = cfg.train.total_batch_size // dist.get_world_size()
         num_workers = cfg.train.num_workers
+        
         return DataLoader(
-            instantiate(cfg.dataset),
+            dataset,
             num_workers=num_workers,
-            batch_size=cfg.train.total_batch_size // dist.get_world_size(),
+            batch_size=batch_size,
+            persistent_workers=(num_workers > 0),
             drop_last=True,
             pin_memory=True,
-            collate_fn=LazyFactory.safe_collate,
-            # Use 'spawn' instead of 'fork' so workers start without inheriting
-            # the parent's CUDA/NCCL state, which would cause hangs in DDP.
-            multiprocessing_context='spawn' if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
+            # Added for HyCoCLIP_V2
+            collate_fn=LazyFactory.safe_collate
         )
 
     @staticmethod
@@ -249,8 +255,8 @@ class LazyFactory:
 
         # Wrap model in DDP if using more than one GPUs.
         if dist.get_world_size() > 1:
-            # Convert device to GPU index if it's a torch.device object
-            device_id = device.index if isinstance(device, torch.device) else device
+            # CRITICAL: Use device_ids with integer GPU index for proper NCCL rank binding
+            device_id = device.index if hasattr(device, 'index') and device.index is not None else int(torch.cuda.current_device())
             model = DistributedDataParallel(
                 model, 
                 device_ids=[device_id], 
