@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 
 import torch
 from torch import nn
@@ -863,14 +864,25 @@ class HyCoCLIP(MERU):
         hier_sample_type: HierarchySampleType = HierarchySampleType.ALL,
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
-        loss_fn="hycoclip_loss"
+        loss_fn="hycoclip_loss",
+        repulsion_weight: float = 0.1,
+        repulsion_r0: float = 0.5
     ):
         """
         Un-documented args are same as `MERU`.
 
         Args:
             use_boxes: Whether to use box images and texts for training.
+            repulsion_weight: Weight of the repulsion term, only used by the
+                `*_repulsion_poly` losses.
+            repulsion_r0: Target minimum norm below which repulsion kicks in,
+                only used by the `*_repulsion_poly` losses.
         """
+        # Set before `super().__init__()`: it resolves `loss_fn` through this
+        # class's `get_loss_fn`, which needs these already in place.
+        self.repulsion_weight = repulsion_weight
+        self.repulsion_r0 = repulsion_r0
+
         super().__init__(visual=visual,
                         textual=textual,
                         embed_dim=embed_dim,
@@ -1179,6 +1191,10 @@ class HyCoCLIP(MERU):
             return losses.chordclip_loss
         elif loss_fn_name == "hycoclip_deep_loss":
             return losses.hycoclip_deep_loss
+        elif loss_fn_name == "hycoclip_deep_loss_repulsion_poly":
+            return partial(losses.hycoclip_deep_loss_repulsion_poly,
+                           repulsion_weight=self.repulsion_weight,
+                           repulsion_r0=self.repulsion_r0)
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
         
@@ -1214,14 +1230,25 @@ class HyCoCLIP_Re_Weight(MERU):
         pixel_mean: tuple[float, float, float] = (0.485, 0.456, 0.406),
         pixel_std: tuple[float, float, float] = (0.229, 0.224, 0.225),
         use_hierarchies: bool = True,
-        loss_fn="hyco_reweight_loss"
+        loss_fn="hyco_reweight_loss",
+        repulsion_weight: float = 0.1,
+        repulsion_r0: float = 0.5
     ):
         """
         Un-documented args are same as `MERU`.
 
         Args:
             use_boxes: Whether to use box images and texts for training.
+            repulsion_weight: Weight of the repulsion term, only used by the
+                `*_repulsion_poly` losses.
+            repulsion_r0: Target minimum norm below which repulsion kicks in,
+                only used by the `*_repulsion_poly` losses.
         """
+        # Set before `super().__init__()`: it resolves `loss_fn` through this
+        # class's `get_loss_fn`, which needs these already in place.
+        self.repulsion_weight = repulsion_weight
+        self.repulsion_r0 = repulsion_r0
+
         super().__init__(visual=visual,
                          textual=textual,
                          embed_dim=embed_dim,
@@ -1307,11 +1334,17 @@ class HyCoCLIP_Re_Weight(MERU):
         Returns the loss function based on the provided name.
         """
         if loss_fn_name == "hyco_reweight_loss":
-            return losses.hyco_reweight_loss 
+            return losses.hyco_reweight_loss
+        elif loss_fn_name == "hyco_reweight_loss_per_sample":
+            return losses.hyco_reweight_loss_per_sample
+        elif loss_fn_name == "hyco_reweight_loss_repulsion_poly":
+            return partial(losses.hyco_reweight_loss_repulsion_poly,
+                           repulsion_weight=self.repulsion_weight,
+                           repulsion_r0=self.repulsion_r0)
         elif loss_fn_name == "hyco_reweight_slightly_smaller_K_loss":
-            return losses.hyco_reweight_loss_slightly_smaller_K # FOR TESTING K 
+            return losses.hyco_reweight_loss_slightly_smaller_K # FOR TESTING K
         elif loss_fn_name == "hyco_reweight_very_small_K_loss":
-            return losses.hyco_reweight_loss_very_small_K # FOR TESTING K 
+            return losses.hyco_reweight_loss_very_small_K # FOR TESTING K
         else:
             raise ValueError(f"Unknown loss function: {loss_fn_name}.")
         
