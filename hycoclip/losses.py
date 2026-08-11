@@ -251,7 +251,6 @@ def hycoclip_deep_loss(image_feats, text_feats, box_image_feats, box_text_feats,
     elif hier_sample_type == "SINGLE_RANDOM":
         # randomly sample an index to use as hierarchical sample for both contrastive and entailment loss, if using single random sampling
         random_hier_index = torch.randint(0, len(hierarchy_feats_list), (1, 1)).item()
-        print("RANDOM HIER INDEX:", random_hier_index)
         # 0.25 --> 0.2 to account for the 1 extra hierarchical sample
         contrastive_loss_weight = 0.2
         # 0.5 --> 0.3333 to account for the 1 extra hierarchical sample
@@ -495,6 +494,124 @@ def hyco_reweight_loss(image_feats, text_feats, box_image_feats, box_text_feats,
         },
     }
 
+
+
+@torch.autocast(device_type=_device_type, dtype=_cast_dtype, enabled=_enable_autocast)
+def hyco_reweight_loss_per_sample(image_feats, text_feats, box_image_feats, box_text_feats, all_image_feats, all_text_feats, hierarchy_feats, pairwise_scores, _curv, _rank, _scale, entail_weight=1.0, contrast_weight=1.0):
+    """
+    Computes the HyCoCLIP ReWeight loss.
+    """
+    
+    # Compute logits for contrastive loss.
+    image_logits = -L.pairwise_dist(image_feats, all_text_feats, _curv)
+    text_logits = -L.pairwise_dist(text_feats, all_image_feats, _curv)
+    box_image_logits = -L.pairwise_dist(box_image_feats, all_text_feats, _curv)
+    box_text_logits = -L.pairwise_dist(box_text_feats, all_image_feats, _curv)
+
+    # using hyperbolic distance
+    hier_logits_1 = L.elementwise_dist(box_text_feats, hierarchy_feats[0], _curv)
+    hier_logits_2 = L.elementwise_dist(hierarchy_feats[0], hierarchy_feats[1], _curv)
+    hier_logits_3 = L.elementwise_dist(hierarchy_feats[1], hierarchy_feats[2], _curv)
+    hier_logits_4 = L.elementwise_dist(hierarchy_feats[2], hierarchy_feats[3], _curv)
+
+    # mean elementwise distance between the hierarchy entries 
+    mean_elementwise_dist = 0.25 * (
+        (hier_logits_1**2).mean() +
+        (hier_logits_2**2).mean() +
+        (hier_logits_3**2).mean() +
+        (hier_logits_4**2).mean()
+    )
+
+    # Compute cross entropy loss: we compute log probabilities and take the
+    # diagonal elements as targets: image[i] should match text[i] in batch.
+    # Shift the targets according to rank of GPU process (we assume that all
+    # GPU processes have the same local batch size).
+    targets = get_targets(image_logits.size(0), image_logits.device, _rank)
+
+    contrastive_loss = (
+        0.25*(
+            nn.functional.cross_entropy(_scale * image_logits, targets)
+            + nn.functional.cross_entropy(_scale * text_logits, targets)
+            + nn.functional.cross_entropy(_scale * box_image_logits, targets)
+            + nn.functional.cross_entropy(_scale * box_text_logits, targets)
+        )
+        # hierarchy contrast
+        + (0.5 * mean_elementwise_dist)
+    )   
+
+    # tried min_radius=0.05 but also didnt include it in hierarchy half apertures
+    # might have been a too harsh decrease from 0.1, try 0.75
+
+    # Hyperbolic entailment loss: text should entail matching image.
+    _angle = L.oxy_angle(text_feats, image_feats, _curv)
+    _aperture = L.half_aperture(text_feats, _curv)
+
+    _box_angle = L.oxy_angle(box_text_feats, box_image_feats, _curv)
+    _box_aperture = L.half_aperture(box_text_feats, _curv)
+
+    _cross_image_angle = L.oxy_angle(box_image_feats, image_feats, _curv)
+    _box_image_aperture = L.half_aperture(box_image_feats, _curv)
+
+    _cross_text_angle = L.oxy_angle(box_text_feats, text_feats, _curv)
+    _box_text_aperture = L.half_aperture(box_text_feats, _curv)
+
+    # angle chain between each consecutive element in the hierarchy
+    hier_chain_angle_1 = L.oxy_angle(hierarchy_feats[0], box_text_feats, _curv)
+    hier_chain_angle_2 = L.oxy_angle(hierarchy_feats[1], hierarchy_feats[0], _curv)
+    hier_chain_angle_3 = L.oxy_angle(hierarchy_feats[2], hierarchy_feats[1], _curv)
+    hier_chain_angle_4 = L.oxy_angle(hierarchy_feats[3], hierarchy_feats[2], _curv)
+
+    # apertures of hierarchy entries
+    hier_aperture_1 = L.half_aperture(hierarchy_feats[0], _curv)
+    hier_aperture_2 = L.half_aperture(hierarchy_feats[1], _curv)
+    hier_aperture_3 = L.half_aperture(hierarchy_feats[2], _curv)
+    hier_aperture_4 = L.half_aperture(hierarchy_feats[3], _curv)
+
+    # Hyperparameters for apertures
+    _global_aperture_thresh = 0.7   # inter-modal
+    _local_aperture_thresh = 1.2    # intra-modal
+
+    text_image_entailment_loss = torch.clamp(_angle - _global_aperture_thresh * _aperture, min=0).mean()
+    box_text_image_entailment_loss = torch.clamp(_box_angle - _global_aperture_thresh * _box_aperture, min=0).mean()
+    cross_image_entailment_loss = torch.clamp(_cross_image_angle - _local_aperture_thresh * _box_image_aperture, min=0).mean()
+    cross_text_entailment_loss = torch.clamp(_cross_text_angle - _local_aperture_thresh * _box_text_aperture, min=0).mean()
+
+    # Re_Weight: entailment chain using original entailment technique and global aperture threshold
+    hier_entailment_loss_1 = torch.clamp(hier_chain_angle_1 - _global_aperture_thresh * hier_aperture_1, min=0)
+    hier_entailment_loss_2 = torch.clamp(hier_chain_angle_2 - _global_aperture_thresh * hier_aperture_2, min=0)
+    hier_entailment_loss_3 = torch.clamp(hier_chain_angle_3 - _global_aperture_thresh * hier_aperture_3, min=0)
+    hier_entailment_loss_4 = torch.clamp(hier_chain_angle_4 - _global_aperture_thresh * hier_aperture_4, min=0)
+
+
+    entailment_loss = (
+        text_image_entailment_loss 
+        + box_text_image_entailment_loss 
+        + cross_image_entailment_loss 
+        + cross_text_entailment_loss
+
+        # Re_Weight: modulating the entailments with the pairwise scores
+        + (pairwise_scores[0] * hier_entailment_loss_1).mean()
+        + (pairwise_scores[1] * hier_entailment_loss_2).mean()
+        + (pairwise_scores[2] * hier_entailment_loss_3).mean()
+        + (pairwise_scores[3] * hier_entailment_loss_4).mean()  
+    )
+
+    # loss = (contrast_weight * contrastive_loss) + (entail_weight * entailment_loss)
+    loss = contrastive_loss + (entail_weight * entailment_loss)
+
+    return {
+        "loss": loss,
+        "logging": {
+            "contrastive_loss": contrastive_loss,
+            "text_image_entailment_loss": text_image_entailment_loss,
+            "box_text_image_entailment_loss": box_text_image_entailment_loss,
+            "cross_image_entailment_loss": cross_image_entailment_loss,
+            "cross_text_entailment_loss": cross_text_entailment_loss,
+            "entailment_loss": entailment_loss,
+            "logit_scale": _scale,
+            "curv": _curv,
+        },
+    }
 
 """
 -----------------------------------------------------------

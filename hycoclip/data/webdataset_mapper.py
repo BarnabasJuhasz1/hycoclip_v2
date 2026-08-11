@@ -116,8 +116,15 @@ class JsonAnnotationLoader:
         if shard_id not in self.cache:
             json_path = shard_id + ".json"
             json_path = self.folder / json_path
-            with open(json_path, "r") as f:
-                annotations = json.load(f)
+            try:
+                with open(json_path, "r") as f:
+                    annotations = json.load(f)
+            except FileNotFoundError:
+                # A few TAR shards have no annotation JSON at all. They are still
+                # usable training data, so cache an empty mapping and let the
+                # caller fall back rather than killing the worker.
+                logger.warning(f"No annotation JSON at {json_path}; shard will be served unannotated.")
+                annotations = {}
 
             # Evict least recently used if cache is full
             if len(self.cache) >= self.max_cache_size:
@@ -129,7 +136,9 @@ class JsonAnnotationLoader:
             # Mark as recently used
             self.cache.move_to_end(shard_id)
 
-        sample[self.annotation_key] = self.cache[shard_id][sample['__key__']]
+        # Only a fraction of the TAR keys carry an annotation; missing ones get
+        # `None` and are handled by the mapper.
+        sample[self.annotation_key] = self.cache[shard_id].get(sample["__key__"])
         return sample
 
 class ImageTextWebDataset(IterableDataset):
@@ -438,8 +447,22 @@ class GroundedDatasetTarMapper:
         
 class ExtendedGroundedDatasetTarMapper:
     """
-    Mapper to pre-process image-text instances from Grounded dataset TAR files.
+    Mapper to pre-process image-text instances from Grounded dataset TAR files,
+    enriched with the HyperHi5 text-abstraction hierarchies.
+
+    HyperHi5 only annotates a subset of GRIT (roughly 15% of keys, and not every
+    box of an annotated key), so this mapper serves the *whole* of GRIT and falls
+    back to repeating the box caption when a sample has no hierarchy. That
+    fallback is deliberate rather than a placeholder: with `box_text` in every
+    hierarchy slot, each hierarchy loss term collapses exactly onto a term the
+    base HyCoCLIP loss already computes (box_text vs image, vs box_image, vs
+    text), so unannotated samples keep training as ordinary HyCoCLIP instead of
+    contributing a fabricated target.
     """
+
+    # Number of hierarchy levels served per sample. The stored chains have 5
+    # entries, the first of which duplicates the box caption and is dropped.
+    _NUM_LEVELS = 4
 
     def __init__(
         self,
@@ -450,20 +473,21 @@ class ExtendedGroundedDatasetTarMapper:
         ],
         # use_extra_hierarchy_samples: bool = False,
         use_proposed_hierachies: bool = False,
+        hier_folder: str = "datasets/train/HyperHi5/v1/json_pairwise",
     ):
         """
         Args:
             image_transform: List of image transformations from torchvision.
-            use_extra_hierarchy_samples: If True, emit 5 (for CLIP/MERU) or 4 (for HyCoCLIP) additional sample for every
-                input sample where `box_text` is replaced by an element
-                from the sample's `text_hierarchy` (excluding the first element
-                which equals the original box text).
+            use_proposed_hierachies: Prefer the re-ordered `proposed` chain over
+                `original` for the boxes that have one (about a third of them).
+            hier_folder: Directory of per-shard hierarchy JSONs, named to match
+                the TAR shards (`00000.json` for `00000.tar`).
         """
         self.image_transform = T.Compose(image_transform)
         self.annotation_loader = JsonAnnotationLoader(
-            folder="datasets/HyperHi5/v1/json_pairwise",
+            folder=hier_folder,
             annotation_key="text_hierarchy",
-            max_cache_size=100
+            max_cache_size=8
         )
         # self.use_extra_hierarchy_samples = use_extra_hierarchy_samples
         self.use_proposed_hierachies = use_proposed_hierachies
@@ -474,32 +498,51 @@ class ExtendedGroundedDatasetTarMapper:
         dataset_dict = self.annotation_loader(dataset_dict)
 
         parent_id = f"parent{random_box:03d}"
+        box_text = dataset_dict[f"{parent_id}.txt"]
 
-        # decide whether to use proposed hierarchies or original ones
-        if self.use_proposed_hierachies:
-            # use proposed if available, otherwise fallback to original
-            if "proposed" in dataset_dict["text_hierarchy"][parent_id]:
-                parent_original = dataset_dict["text_hierarchy"][parent_id]["proposed"]
+        annotations = dataset_dict["text_hierarchy"]
+        # The drawn box may be unannotated even when the key is.
+        parent_annotation = annotations.get(parent_id) if annotations else None
+
+        hierarchy_list, scores = None, None
+        if parent_annotation:
+            # decide whether to use proposed hierarchies or original ones
+            if self.use_proposed_hierachies and "proposed" in parent_annotation:
+                # use proposed if available, otherwise fallback to original
+                parent_original = parent_annotation["proposed"]
             else:
-                parent_original = dataset_dict["text_hierarchy"][parent_id]["original"]
-        else:
-            # use original hierarchies
-            parent_original = dataset_dict["text_hierarchy"][parent_id]["original"]
+                # use original hierarchies
+                parent_original = parent_annotation["original"]
 
-        # skip the first element of hierarchy because it is equal to the parent box text
-        hierarchy_list = parent_original.get("hierarchy", [])[1:]
+            # skip the first element of hierarchy because it is equal to the parent box text
+            hierarchy = parent_original.get("hierarchy", [])[1:]
+            pairwise = parent_original.get("pairwise_scores", {})
+            # Chain length is uniform across the corpus, but a short entry would
+            # otherwise break collation of the whole batch.
+            if len(hierarchy) == self._NUM_LEVELS and len(pairwise) == self._NUM_LEVELS:
+                hierarchy_list = hierarchy
+                scores = np.array(
+                    [pairwise[str(i)]["final_score"] for i in range(self._NUM_LEVELS)],
+                    dtype=np.float32,
+                )
+
+        if hierarchy_list is None:
+            # Unannotated: degenerate to the box caption (see class docstring).
+            # Zero scores also neutralise the score-modulated terms in the
+            # re-weight losses.
+            hierarchy_list = [box_text] * self._NUM_LEVELS
+            scores = np.zeros(self._NUM_LEVELS, dtype=np.float32)
 
         orig = {
             "__key__": dataset_dict["__key__"],
             "image": self.image_transform(dataset_dict["child.jpg"]),
             "text": dataset_dict["child.txt"],
             "box_image": self.image_transform(dataset_dict[f"{parent_id}.jpg"]),
-            "box_text": dataset_dict[f"{parent_id}.txt"],
+            "box_text": box_text,
             "text_hierarchy": hierarchy_list,
-            "scores": np.array([parent_original["pairwise_scores"][str(i)]["final_score"]
-                       for i in range(len(parent_original["pairwise_scores"]))], dtype=np.float32),
+            "scores": scores,
         }
-    
+
         # if not self.use_extra_hierarchy_samples:
         return orig
 
